@@ -16,6 +16,8 @@
 #include <cstdint>
 #include <type_traits>
 
+#include <xmmintrin.h>
+
 #if defined(_DEBUG)
     #define FK_ASSERT(condition) do { if (!(condition)) __debugbreak(); } while (0)
 #else
@@ -38,7 +40,16 @@ namespace Funky
     inline void MemCopy(void* dst, const void* src, size_t size) { __builtin_memcpy(dst, src, size); }
     inline void MemMove(void* dst, const void* src, size_t size) { __builtin_memmove(dst, src, size); }
     inline void MemZero(void* dst, size_t size) { __builtin_memset(dst, 0, size); }
-    inline bool MemEqual(const void* a, const void* b, size_t size) { return __builtin_memcmp(a, b, size) == 0; }
+    // Not __builtin_memcmp: with a runtime size it becomes a call to the CRT's memcmp.
+    inline bool MemEqual(const void* a, const void* b, size_t size)
+    {
+        const uint8_t* p = static_cast<const uint8_t*>(a);
+        const uint8_t* q = static_cast<const uint8_t*>(b);
+        for (size_t i = 0; i < size; ++i)
+            if (p[i] != q[i])
+                return false;
+        return true;
+    }
 
     template <class T>
     T* AllocZeroed(size_t count = 1)
@@ -334,7 +345,8 @@ namespace Funky
     constexpr float Saturate(float v) { return Clamp(v, 0.0f, 1.0f); }
     constexpr float Abs(float v) { return v < 0 ? -v : v; }
 
-    inline float Sqrt(float v) { return __builtin_sqrtf(v); } // lowers to sqrtss, no libcall
+    // sqrtss under any /fp model and any clang version (__builtin_sqrtf keeps an errno path that calls the CRT's sqrtf).
+    inline float Sqrt(float v) { return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(v))); }
 
     // Valid for |v| < 2^31 (plenty for UI). Not __builtin_floorf: that can become a CRT call.
     inline float Floor(float v) { float t = float(int32_t(v)); return t > v ? t - 1.0f : t; }

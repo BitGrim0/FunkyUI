@@ -10,6 +10,14 @@
 
 #pragma once
 
+// Omitting props fields is the intended use: silence clang's /W4 warning about it. Not popped,
+// since the warning fires in the client's code after this header.
+#if defined(__has_warning)
+    #if __has_warning("-Wmissing-designated-field-initializers")
+        #pragma clang diagnostic ignored "-Wmissing-designated-field-initializers"
+    #endif
+#endif
+
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -458,6 +466,7 @@ namespace Funky
         Funky::Glow Glow;                  // shown on hover when Radius > 0
         Funky::Shadow Shadow;
         bool IsEnabled = true;
+        float Opacity = 1;
         Thickness Margin;
         Funky::HorizontalAlignment HorizontalAlignment = Funky::HorizontalAlignment::Stretch;
         Funky::VerticalAlignment VerticalAlignment = Funky::VerticalAlignment::Center;
@@ -484,6 +493,7 @@ namespace Funky
         Funky::Font Font;
         Funky::Glow Glow = { Rgba(0x3AA8FF80), 8 }; // shown when checked
         bool IsEnabled = true;
+        float Opacity = 1;
         Thickness Margin;
         Funky::HorizontalAlignment HorizontalAlignment = Funky::HorizontalAlignment::Left;
         Funky::VerticalAlignment VerticalAlignment = Funky::VerticalAlignment::Center;
@@ -506,6 +516,7 @@ namespace Funky
         float ThumbRadius = 7;
         Funky::Glow Glow = { Rgba(0x3AA8FF99), 10 }; // thumb glow on hover / drag
         bool IsEnabled = true;
+        float Opacity = 1;
         Thickness Margin;
         Funky::HorizontalAlignment HorizontalAlignment = Funky::HorizontalAlignment::Stretch;
         Funky::VerticalAlignment VerticalAlignment = Funky::VerticalAlignment::Center;
@@ -560,7 +571,7 @@ namespace Funky
         void* TargetWindow = nullptr;          // HWND of the (borderless) target window
         std::string_view WindowClassName;      // UTF-8, required, unique per process
         std::string_view DefaultFontFamily;    // UTF-8, required, e.g. the client's UI font
-        Funky::Allocator Allocator;            // optional; default = process heap
+        Funky::Allocator Allocator;            // optional; default = process heap. Process-wide: give every overlay the same one
     };
 
     class Ui;

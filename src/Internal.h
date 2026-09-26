@@ -19,10 +19,10 @@ namespace Funky
     enum ShapeType : uint32_t
     {
         ShapeRoundRect = 0, // P0 = rect (minX, minY, maxX, maxY), P1 = radii (TL, TR, BR, BL)
-        ShapeSegment = 1,   // P0 = (ax, ay, bx, by), P1.x = half thickness (round caps)
+        ShapePolyline = 1,  // P0 = (first point, point count, half thickness): round-joined, round-capped stroke through UiImpl::Points
         ShapeArc = 2,       // P0 = (cx, cy, radius, half thickness), P1 = (start angle, sweep angle) radians, clockwise from +X (y down), round caps
         ShapeTriangle = 3,  // P0 = (ax, ay, bx, by), P1 = (cx, cy); edges AA'd only if their Flag*Edge bit is set
-        ShapeGlyph = 4,     // Bounds = glyph quad, P0 = normalized atlas UV (u0, v0, u1, v1); coverage in atlas .r, distance field in .g
+        ShapeGlyph = 4,     // Bounds = glyph quad, P0 = atlas texel rect (x0, y0, x1, y1); coverage in atlas .r, distance field in .g
         ShapeImage = 5,     // stage 3: Bounds = image rect, P0 = UV, P1 = corner radii
     };
 
@@ -138,11 +138,16 @@ namespace Funky
         void Resize(uint32_t width, uint32_t height);
         void UpdateAtlas(const AtlasUpdate& update);
 
-        // Clears to transparent, draws the batches and presents. Shapes are in DIPs.
+        // After a device loss (driver update, GPU reset or switch) recreates the device and swap chain,
+        // retrying at most every few frames. Returns true when it did: the atlas must be uploaded again.
+        bool RestoreDevice();
+
+        // Clears to transparent, draws the batches and presents. Shapes and points are in DIPs.
         // clips[0] must be the "no clipping" rect.
         bool Render(const GpuShape* shapes, uint32_t shapeCount,
                     const DrawBatch* batches, uint32_t batchCount,
-                    const ClipRect* clips, uint32_t clipCount, float dpiScale);
+                    const ClipRect* clips, uint32_t clipCount,
+                    const Vec2* points, uint32_t pointCount, float dpiScale);
 
         void* FrameWaitable() const;        // HANDLE of the swap chain's frame-latency waitable object
 
@@ -158,7 +163,7 @@ namespace Funky
     struct GlyphQuad
     {
         float X, Y, Width, Height;  // DIPs, relative to the layout's top-left corner (pixel-snapped at DpiScale)
-        float U0, V0, U1, V1;       // normalized atlas coordinates
+        float U0, V0, U1, V1;       // atlas texels (stay valid when the atlas grows)
     };
 
     struct TextLayout
@@ -183,8 +188,10 @@ namespace Funky
 
         // Pending atlas upload, if any. The pixels stay valid until the next Layout() call.
         bool TakeAtlasUpdate(AtlasUpdate& update);
+        void InvalidateAtlas();     // the GPU copy is gone: the next update uploads the whole atlas
 
-        // Evicts layouts not used for a while.
+        // Evicts layouts and formats not used for a while. A full atlas is reset here, after the
+        // frame, so glyphs emitted earlier in a frame always stay valid.
         void EndFrame(uint32_t frame);
 
     private:
@@ -253,9 +260,11 @@ namespace Funky
         Vec2 Position;          // top-left, DIPs
         Vec2 Size;              // outer size measured last frame
         Rect LastRect;          // rect drawn last frame (hit testing at BeginFrame)
+        Vec2 DragOffset;        // pointer - position when the drag started
+        float Opacity;          // props.Opacity × fade-in, applied to the panel's shapes by BuildFrame
         uint32_t LastFrame;     // frame the panel was last submitted
         uint32_t FirstFrame;    // frame it (re)appeared: that frame is an invisible sizing pass
-        bool Dragged;           // position was set by dragging (Anchor no longer applies)
+        bool Dragged;           // position was set by dragging (Anchor no longer applies; kept by GC)
     };
 
     // Open container during the frame.
@@ -271,18 +280,21 @@ namespace Funky
         Vec2 Measured;              // children extent this frame (from Content origin, desired sizes)
         LayoutSpec Spec;            // the container's own layout spec (used at EndScope)
         Rect Outer;                 // the container's own rect as placed at Begin
+        uint32_t ClipIndex;         // clip rect active inside this container
         // Grid
+        GridLength Columns[MaxGridColumns];
         uint32_t ColumnCount;
-        uint32_t Column;
+        uint32_t Column;                      // column of the next cell
         uint32_t Row;
-        float ColumnX[MaxGridColumns];
+        float ColumnX[MaxGridColumns];        // from Content.X
         float ColumnWidth[MaxGridColumns];
         float ColumnMeasured[MaxGridColumns]; // widest cell per column this frame
-        float RowY;
-        float RowHeight;                      // tallest cell of the current row this frame
+        float RowY;                           // top of the current row (from Content.Y)
+        float RowHeight;                      // current row height: max(last frame's, tallest cell so far)
+        float RowMeasured;                    // tallest cell of the current row this frame
         float RowSpacing;
         // Panel
-        uint32_t ClipIndex;         // clip rect active inside this container
+        bool Movable;
     };
 
     // A contiguous range of shapes emitted into one layer.
@@ -311,7 +323,7 @@ namespace Funky
         Renderer Gpu;
         TextSystem Text;
         Arena Frame;                        // reset every BeginFrame
-        Arena Scratch;                      // long-lived scratch for init
+        Arena Scratch;                      // Init / LoadFont scratch, reset after each use
 
         // Frame
         uint32_t FrameIndex = 0;
@@ -320,6 +332,8 @@ namespace Funky
         float Dt = 0;
         Vec2 Viewport;                      // DIPs
         float Scale = 1;
+        uint32_t SurfaceWidth = 0;          // physical pixels the renderer is sized for
+        uint32_t SurfaceHeight = 0;
         bool PresentedLastFrame = false;
         uint64_t LastFrameHash = 0;
         bool ForceRedraw = true;
@@ -348,6 +362,7 @@ namespace Funky
         Array<GpuShape> Shapes;             // in emission order
         Array<ShapeRun> Runs;
         Array<ClipRect> Clips;              // [0] = no clipping
+        Array<Vec2> Points;                 // polyline vertices (ShapePolyline)
         uint64_t CurrentLayer = 0;
         uint32_t CurrentClip = 0;
         Array<GpuShape> FinalShapes;        // Shapes reordered by layer for rendering
@@ -358,15 +373,16 @@ namespace Funky
         void Shutdown();
         Container& Top() { return OpenContainers.Back(); }
         uint64_t MakeId(Key key);           // HashCombine(parent id, key) or positional when key is none
-        GpuShape* EmitShapes(uint32_t count); // appends to the current layer run (sets clip index)
+        GpuShape* EmitShapes(uint32_t count); // zeroed shapes in the current layer run, TypeFlags = clip index (OR the type in); null on OOM
         void SetLayer(uint64_t layer);
         uint32_t PushClip(Rect rect);       // intersected with the current clip; returns its index
         Funky::Widget Interact(uint64_t id, Rect rect, bool enabled); // hover / press / click
         void BuildFrame();                  // runs → FinalShapes/Batches (applies panel opacity)
+        void EndPanel();                    // EndScope of a panel: measure, drag, z-order
 
         // --- Layout.cpp ------------------------------------------------------------------
         Rect Place(Vec2 desired, const LayoutSpec& spec); // places a leaf in the current container
-        void BeginContainer(ContainerKind kind, uint64_t id, const LayoutSpec& spec);
+        bool BeginContainer(ContainerKind kind, uint64_t id, const LayoutSpec& spec); // false on OOM (nothing opened)
         void EndContainer();
     };
 
