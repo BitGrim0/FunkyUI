@@ -40,12 +40,30 @@ namespace Funky
     inline void MemCopy(void* dst, const void* src, size_t size) { __builtin_memcpy(dst, src, size); }
     inline void MemMove(void* dst, const void* src, size_t size) { __builtin_memmove(dst, src, size); }
     inline void MemZero(void* dst, size_t size) { __builtin_memset(dst, 0, size); }
-    // Not __builtin_memcmp: with a runtime size it becomes a call to the CRT's memcmp.
+    // Not __builtin_memcmp: with a runtime size it becomes a call to the CRT's memcmp. Compares
+    // 32 bytes per branch and stops at the first difference.
     inline bool MemEqual(const void* a, const void* b, size_t size)
     {
         const uint8_t* p = static_cast<const uint8_t*>(a);
         const uint8_t* q = static_cast<const uint8_t*>(b);
-        for (size_t i = 0; i < size; ++i)
+        size_t i = 0;
+        for (; i + 32 <= size; i += 32)
+        {
+            uint64_t x[4], y[4];
+            __builtin_memcpy(x, p + i, 32);
+            __builtin_memcpy(y, q + i, 32);
+            if (((x[0] ^ y[0]) | (x[1] ^ y[1]) | (x[2] ^ y[2]) | (x[3] ^ y[3])) != 0)
+                return false;
+        }
+        for (; i + 8 <= size; i += 8)
+        {
+            uint64_t x, y;
+            __builtin_memcpy(&x, p + i, 8);
+            __builtin_memcpy(&y, q + i, 8);
+            if (x != y)
+                return false;
+        }
+        for (; i < size; ++i)
             if (p[i] != q[i])
                 return false;
         return true;
@@ -167,7 +185,7 @@ namespace Funky
         V* FindOrAdd(uint64_t key, bool* isNew = nullptr)
         {
             FK_ASSERT(key != 0);
-            if ((Count + 1) * 4 > Capacity * 3 && !Grow())
+            if ((Count + 1) * 4 > Capacity * 3 && !Rehash(Capacity ? Capacity * 2 : 64))
                 return nullptr;
             uint32_t mask = Capacity - 1;
             for (uint32_t i = uint32_t(Mix(key)) & mask;; i = (i + 1) & mask)
@@ -233,6 +251,20 @@ namespace Funky
             Count = 0;
         }
 
+        // Far larger than its use (after a burst): walking it (RemoveIf, ForEach) would cost every later frame the peak.
+        bool IsSparse() const { return Capacity > 1024 && Count * 8 < Capacity; }
+
+        // A sparse map is rebuilt smaller. Invalidates value pointers.
+        void ShrinkIfSparse()
+        {
+            if (!IsSparse())
+                return;
+            uint32_t capacity = 64;
+            while (Count * 4 > capacity) // at most half full afterwards
+                capacity *= 2;
+            Rehash(capacity);
+        }
+
         void Free()
         {
             MemFree(Slots);
@@ -249,9 +281,8 @@ namespace Funky
             return k;
         }
 
-        bool Grow()
+        bool Rehash(uint32_t newCapacity)
         {
-            uint32_t newCapacity = Capacity ? Capacity * 2 : 64;
             Slot* newSlots = AllocZeroed<Slot>(newCapacity);
             if (!newSlots)
                 return false;
@@ -313,6 +344,15 @@ namespace Funky
             return static_cast<T*>(Alloc(sizeof(T) * count, alignof(T) < 16 ? 16 : alignof(T)));
         }
 
+        // Shrinks the most recent allocation to size bytes (0 gives it back).
+        void Trim(void* last, size_t size)
+        {
+            uintptr_t base = reinterpret_cast<uintptr_t>(Current + 1);
+            uintptr_t start = reinterpret_cast<uintptr_t>(last);
+            FK_ASSERT(Current && start >= base && start + size <= base + Current->Used);
+            Current->Used = start + size - base;
+        }
+
         void Reset();  // keeps the memory
         void Free();
     };
@@ -330,7 +370,7 @@ namespace Funky
         return h ? h : 1; // 0 is reserved as "empty" in HashMap
     }
 
-    // Fast hash of an arbitrary byte range (used for text caching and frame change detection).
+    // Fast hash of an arbitrary byte range (used for text caching).
     uint64_t HashMemory(const void* data, size_t size, uint64_t seed = 0);
 
     // ------------------------------------------------------------------------------------
@@ -370,6 +410,10 @@ namespace Funky
 
     LinearColor ToLinear(Color c);
     Color FromLinear(LinearColor c);
+
+    // Premultiplied linear RGBA (4 floats): the space colors blend in (gradients, Transition, Lerp).
+    void ToPremultipliedLinear(Color c, float* out);
+    Color FromPremultipliedLinear(const float* v); // transparent when alpha <= 0
 
     // ------------------------------------------------------------------------------------
     // Text encoding

@@ -35,6 +35,7 @@ namespace Funky
         FlagEdgeAB = 1u << 9,    // triangle edge a→b is an outer edge (antialiased)
         FlagEdgeBC = 1u << 10,
         FlagEdgeCA = 1u << 11,
+        FlagShadow = 1u << 12,   // round rect without a gradient: a shadow under it, offset P2.xy, sigma P2.z (0 = hard), color Fill1
     };
 
     constexpr uint32_t ShapeTypeMask = 0xFFu;
@@ -45,9 +46,9 @@ namespace Funky
         float Bounds[4];     // quad to rasterize (minX, minY, maxX, maxY), already expanded for AA / glow / blur
         float P0[4];         // geometry, see ShapeType
         float P1[4];
-        float P2[4];         // gradient start (xy) and end (zw) points
+        float P2[4];         // gradient start (xy) and end (zw) points; FlagShadow: shadow offset (xy), sigma (z)
         uint32_t Fill0;      // packed Color (R in the lowest byte), sRGB, straight alpha
-        uint32_t Fill1;      // gradient end color
+        uint32_t Fill1;      // gradient end color; FlagShadow: shadow color
         uint32_t Stroke;     // inner stroke color
         uint32_t Glow;       // glow color
         float StrokeWidth;   // DIPs, inner stroke (inside the edge)
@@ -75,6 +76,8 @@ namespace Funky
     {
         float MinX, MinY, MaxX, MaxY; // DIPs
     };
+
+    constexpr ClipRect EmptyBounds = { 3.0e38f, 3.0e38f, -3.0e38f, -3.0e38f }; // start of a union of bounds
 
     enum BatchKind : uint32_t
     {
@@ -225,10 +228,12 @@ namespace Funky
     // Text — DirectWrite text layout + glyph atlas (Text.cpp)
     // ====================================================================================
 
+    // The first fields of a GpuGlyph, relative to the layout: drawing adds the origin, color and clip.
     struct GlyphQuad
     {
-        float X, Y, Width, Height;  // DIPs, relative to the layout's top-left corner (pixel-snapped at DpiScale)
-        float U0, V0, U1, V1;       // atlas texels (stay valid when the atlas grows)
+        float Rect[4];              // DIPs (minX, minY, maxX, maxY) from the layout's top-left (pixel-snapped at DpiScale)
+        uint32_t Texel0;            // atlas texels as in GpuGlyph (stay valid when the atlas grows)
+        uint32_t Texel1;
     };
 
     struct TextLayout
@@ -237,6 +242,7 @@ namespace Funky
         uint32_t GlyphCount;
         Vec2 Size;                  // DIPs: widest line (with trailing spaces) × line heights
         float Baseline;             // DIPs from the top of the first line
+        ClipRect Ink;               // DIPs: union of the quads (meaningless without glyphs)
     };
 
     class TextSystem
@@ -252,6 +258,32 @@ namespace Funky
         // punctuation) is laid out on every call without a cache; other text is shaped and cached while
         // used every frame. scratch holds temporaries.
         const TextLayout* Layout(std::string_view text, const TextStyle& style, float dpiScale, Arena& scratch);
+
+        // Text drawn once: simple text goes straight into glyph instances (Out has room for a glyph per byte),
+        // the same instances as Layout's quads placed at the origin. Returns null when it did (count glyphs,
+        // covering ink, DIPs); otherwise the text needs shaping and its layout is returned, to draw as any other.
+        struct GlyphTarget
+        {
+            GpuGlyph* Out;
+            Vec2 Origin;            // DIPs, pixel-snapped
+            uint32_t Color;         // packed
+            uint32_t Clip;
+
+            void operator()(uint32_t i, const GlyphQuad& q) const
+            {
+                GpuGlyph& g = Out[i];
+                g.Rect[0] = Origin.X + q.Rect[0];
+                g.Rect[1] = Origin.Y + q.Rect[1];
+                g.Rect[2] = Origin.X + q.Rect[2];
+                g.Rect[3] = Origin.Y + q.Rect[3];
+                g.Texel0 = q.Texel0;
+                g.Texel1 = q.Texel1;
+                g.Color = Color;
+                g.Clip = Clip;
+            }
+        };
+        const TextLayout* LayoutInto(std::string_view text, const TextStyle& style, float dpiScale, Arena& scratch, const GlyphTarget& target,
+                                     uint32_t& count, ClipRect& ink);
 
         // Layout(...)->Size; simple text is measured without building quads or rasterizing glyphs.
         Vec2 Measure(std::string_view text, const TextStyle& style, float dpiScale, Arena& scratch);
@@ -381,26 +413,19 @@ namespace Funky
 
     constexpr uint64_t ForegroundLayer = ~0ull;
 
-    // Frame change detection (overlay): a 64-bit hash of everything that decides the frame's pixels.
-    // The data is folded in as it is emitted, while it is still in the cache (see UiImpl::FoldEmitted).
-    struct FrameHash
-    {
-        uint64_t Lanes[4];
-
-        void Reset();
-        void Fold(const void* data, size_t size); // size: a multiple of 8 bytes
-        uint64_t Finish() const;
-    };
-
+    // A Transition. At rest (Progress >= 1) the value is exactly the target, recognized by its bits,
+    // so a finished transition costs one lookup and one comparison. While moving, From and To are the
+    // values as blended (colors: premultiplied linear RGBA).
     struct TransitionState
     {
         float From[4];
         float To[4];
-        float Current[4];
-        float Elapsed;
-        float Duration;
-        uint32_t LastFrame;
+        float Progress;         // 0..1 of the duration
+        uint32_t LastFrame;     // frame it last advanced (at most once per frame)
+        uint64_t Target;        // bits of the target value
     };
+
+    static_assert(sizeof(TransitionState) == 48);
 
     struct UiImpl : Ui
     {
@@ -421,13 +446,7 @@ namespace Funky
         uint32_t SurfaceWidth = 0;          // physical pixels the renderer is sized for
         uint32_t SurfaceHeight = 0;
         bool PresentedLastFrame = false;
-        uint64_t LastFrameHash = 0;
-        bool ForceRedraw = true;
-        FrameHash Hash;                     // overlay: this frame's data folded so far
-        uint32_t HashedShapes = 0;          // prefixes of the arrays already in Hash
-        uint32_t HashedGlyphs = 0;
-        uint32_t HashedPoints = 0;
-        uint32_t HashedClips = 0;
+        bool ForceRedraw = true;            // present the next frame even if it equals the last one
 
         // Input (DIPs)
         InputEvents EmbeddedInput = {};     // embedded mode: fed by SetPointer (physical pixels, left button only)
@@ -461,6 +480,16 @@ namespace Funky
         uint32_t CurrentClip = 0;
         Array<DrawBatch> Batches;           // paint order, built by BuildFrame
 
+        // Overlay: the last frame's arrays (swapped with the current ones at BeginFrame, nothing is copied).
+        // A frame equal to the last one byte for byte is not presented.
+        Array<GpuShape> PreviousShapes;
+        Array<GpuGlyph> PreviousGlyphs;
+        Array<ClipRect> PreviousClips;
+        Array<Vec2> PreviousPoints;
+        Array<DrawBatch> PreviousBatches;
+        Vec2 PreviousViewport;
+        float PreviousScale = 0;
+
         // --- Ui.cpp ----------------------------------------------------------------------
         bool Init(const OverlayDesc& desc);
         bool Init(const EmbeddedDesc& desc);
@@ -469,8 +498,11 @@ namespace Funky
         Container& Top() { return OpenContainers.Back(); }
         uint64_t MakeId(Key key);           // HashCombine(parent id, key) or positional when key is none
         GpuShape* EmitShapes(uint32_t count); // zeroed shapes in the current layer run, TypeFlags = clip index (OR the type in); null on OOM
-        GpuGlyph* EmitGlyphs(uint32_t count, const ClipRect& bounds); // uninitialized glyphs covering bounds (DIPs); null on OOM
-        void FoldEmitted();                 // overlay: folds the data emitted since the last call into Hash
+        // Glyphs: room for up to count at the end of Glyphs (null on OOM), then CommitGlyphs adds the
+        // ones written (covering bounds, DIPs) to the current layer run.
+        GpuGlyph* ReserveGlyphs(uint32_t count);
+        void CommitGlyphs(uint32_t count, const ClipRect& bounds);
+        bool IsSameFrame() const;           // overlay: this frame's data equals the last frame's
         void SetLayer(uint64_t layer);
         uint32_t PushClip(Rect rect);       // intersected with the current clip; returns its index
         Funky::Widget Interact(uint64_t id, Rect rect, bool enabled); // hover / press / click
@@ -481,6 +513,11 @@ namespace Funky
         Rect Place(Vec2 desired, const LayoutSpec& spec); // places a leaf in the current container
         bool BeginContainer(ContainerKind kind, uint64_t id, const LayoutSpec& spec); // false on OOM (nothing opened)
         void EndContainer();
+
+        // --- Draw.cpp --------------------------------------------------------------------
+        // Text laid out once by a control: measured by its Size, then drawn at the placed position.
+        const TextLayout& LayoutText(std::string_view text, const TextStyle& style) { return *Text.Layout(text, style, Scale, Frame); }
+        void DrawLayout(Vec2 position, const TextLayout& layout, const TextStyle& style);
     };
 
     inline UiImpl* Impl(Ui* ui) { return static_cast<UiImpl*>(ui); }

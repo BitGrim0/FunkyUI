@@ -141,14 +141,16 @@ namespace Funky
             uint32_t Index;         // in the system font collection
         };
 
+        // A glyph in the atlas, in the form a quad needs it: physical pixels from the pen, and texels as in GpuGlyph.
         struct GlyphEntry
         {
-            uint16_t X, Y;          // atlas texels
-            uint16_t Width, Height; // 0 = nothing to draw (e.g. space)
-            int32_t Left, Top;      // bearing from the pen position, physical pixels
+            float Left, Top;        // bearing from the pen position
+            float Width, Height;    // 0 = nothing to draw (e.g. space)
+            uint32_t Texel0;        // top-left: x | y << 16
+            uint32_t Texel1;        // bottom-right (exclusive)
         };
 
-        constexpr uint16_t Unresolved = 0xFFFF;     // SizedFont glyph width: not looked up yet
+        constexpr uint32_t Unresolved = 0xFFFFFFFF; // SizedFont glyph Texel0: not looked up yet (texels are below 4096)
 
         struct SimpleGlyph
         {
@@ -174,7 +176,7 @@ namespace Funky
         {
             FontFace* Font;
             float EmPixels;
-            GlyphEntry Glyphs[SimpleCount];     // by SimpleIndex; Width == Unresolved until used
+            GlyphEntry Glyphs[SimpleCount];     // by SimpleIndex; Texel0 == Unresolved until used
         };
 
         // Vertical extent of a line, DIPs. DirectWrite's default line spacing puts the line gap above the ascent.
@@ -198,13 +200,31 @@ namespace Funky
 
         // Quad of a glyph with its pen at (penX, penY) whole pixels from the layout's top-left: pens snap to
         // pixels like DirectWrite's pixel-snapped rendering, and the bitmap was rasterized at a whole-pixel origin.
-        GlyphQuad PlaceGlyph(const GlyphEntry& glyph, float penX, float penY, float dpi)
+        GlyphQuad PlaceGlyph(const GlyphEntry& glyph, float penX, float penY, float dipsPerPixel)
         {
-            float left = penX + float(glyph.Left);
-            float top = penY + float(glyph.Top);
-            float dipsPerPixel = 1 / dpi;
-            return { left * dipsPerPixel, top * dipsPerPixel, float(glyph.Width) * dipsPerPixel, float(glyph.Height) * dipsPerPixel,
-                     float(glyph.X), float(glyph.Y), float(glyph.X + glyph.Width), float(glyph.Y + glyph.Height) };
+            float left = penX + glyph.Left;
+            float top = penY + glyph.Top;
+            return { { left * dipsPerPixel, top * dipsPerPixel, (left + glyph.Width) * dipsPerPixel, (top + glyph.Height) * dipsPerPixel },
+                     glyph.Texel0, glyph.Texel1 };
+        }
+
+        void AddInk(ClipRect& ink, const GlyphQuad& q)
+        {
+            ink = { Min(ink.MinX, q.Rect[0]), Min(ink.MinY, q.Rect[1]), Max(ink.MaxX, q.Rect[2]), Max(ink.MaxY, q.Rect[3]) };
+        }
+
+        // Where LayoutSimple writes the glyphs: layout quads, or glyph instances ready to draw (TextSystem::GlyphTarget).
+        struct QuadSink
+        {
+            GlyphQuad* Out;
+
+            void operator()(uint32_t i, const GlyphQuad& q) const { Out[i] = q; }
+        };
+
+        // Round() of a coordinate that is never below -0.5 (pens and baselines): one conversion.
+        float SnapPixel(float v)
+        {
+            return float(int32_t(v + 0.5f));
         }
 
         // Two-generation cache (as in Zed's GPUI): entries used this frame are in Current, entries used only last
@@ -268,7 +288,7 @@ namespace Funky
             static void FreeValues(HashMap<T*>& map)
             {
                 map.ForEach([](uint64_t, T*& value) { MemFree(value); });
-                if (map.Capacity > 1024 && map.Count * 8 < map.Capacity)
+                if (map.IsSparse())
                     map.Free();
                 else
                     map.Clear();
@@ -384,13 +404,21 @@ namespace Funky
             FrameCache<SizedFont> Sized;                    // by (family, weight, italic, em size in pixels)
             FrameCache<TextLayout> Shaped;                  // by (style, scale, text): header and quads in one block
             Arena FrameLayouts;                             // simple layouts, reset at EndFrame
+
+            // The last sized font looked up (until EndFrame): consecutive text mostly has one style.
+            SizedFont* LastSized = nullptr;
+            uint64_t LastFontKey = 0;
+            uint32_t LastFamily = 0;
+            uint32_t LastWeight = 0;
+            bool LastItalic = false;
+            float LastEmPixels = 0;
             HashMap<GlyphEntry> Glyphs;                     // by (face, glyph index, em size in pixels)
             HashMap<IDWriteFontFace*> GlyphFaces;           // every face in a glyph key, AddRef'd: its address stays unique
 
             // Reused by every layout
             Array<RunFont> RunFonts;                        // Shape: fonts of the text
             Array<ShapedRun> Runs;                          // Shape: runs of the current line
-            Array<GlyphQuad> Quads;                         // LayoutSimple, Shape: glyphs of the text
+            Array<GlyphQuad> Quads;                         // Shape: glyphs of the text
             Array<uint8_t> GlyphPixels;                     // rasterization buffer
 
             uint8_t* Atlas = nullptr;
@@ -508,11 +536,37 @@ namespace Funky
                 sized->Font = font;
                 sized->EmPixels = emPixels;
                 for (GlyphEntry& glyph : sized->Glyphs)
-                    glyph.Width = Unresolved;
+                    glyph.Texel0 = Unresolved;
                 if (!Sized.Add(key, sized))
                 {
                     MemFree(sized);
                     return nullptr;
+                }
+                return sized;
+            }
+
+            // The style's font at its size in pixels; fontKey identifies the font (family, weight, style). Null on failure.
+            SizedFont* Resolve(const TextStyle& style, float dpi, Arena& scratch, const FontFamily*& family, uint64_t& fontKey)
+            {
+                uint32_t familyIndex = style.Font.Index < Families.Count ? style.Font.Index : 0;
+                uint32_t weight = uint32_t(style.FontWeight);
+                float emPixels = style.FontSize * dpi;
+                family = &Families.Data[familyIndex];
+                if (LastSized && LastFamily == familyIndex && LastWeight == weight && LastItalic == style.Italic && LastEmPixels == emPixels)
+                {
+                    fontKey = LastFontKey;
+                    return LastSized;
+                }
+                fontKey = HashCombine(HashCombine(family->Hash, weight), style.Italic);
+                SizedFont* sized = GetSized(fontKey, *family, style, emPixels, scratch);
+                if (sized)
+                {
+                    LastSized = sized;
+                    LastFontKey = fontKey;
+                    LastFamily = familyIndex;
+                    LastWeight = weight;
+                    LastItalic = style.Italic;
+                    LastEmPixels = emPixels;
                 }
                 return sized;
             }
@@ -558,6 +612,7 @@ namespace Funky
                 ReleaseGlyphFaces();
                 Glyphs.Clear();
                 Sized.Clear();
+                LastSized = nullptr;
                 Shaped.Clear();
                 MemZero(Atlas, size_t(AtlasSize) * AtlasSize * 2);
                 ShelfX = ShelfY = Padding;
@@ -627,7 +682,8 @@ namespace Funky
                     }
                 }
                 MarkDirty(x, y, width, height);
-                glyph = { uint16_t(x), uint16_t(y), uint16_t(width), uint16_t(height), bounds.left, bounds.top };
+                glyph = { float(bounds.left), float(bounds.top), float(width), float(height), x | y << 16,
+                          (x + width) | (y + height) << 16 };
                 return true;
             }
 
@@ -744,27 +800,28 @@ namespace Funky
             }
 
             // Lays out text made only of simple code points (and '\n', '\t') that the font has glyphs for, in one pass,
-            // into result (Glyphs stays null). With placeGlyphs its quads go to Quads; without, it only measures: no
-            // quads, nothing rasterized. Returns false when the text needs shaping; out of memory leaves result empty.
-            bool LayoutSimple(std::string_view text, SizedFont& sized, float fontSize, float dpi, bool placeGlyphs, TextLayout& result)
+            // into result (Glyphs stays null). With a sink (room for a glyph per byte of text) the glyphs go there;
+            // without, it only measures: nothing placed or rasterized. Returns false when the text needs shaping; out
+            // of memory leaves result empty.
+            template <class Sink>
+            bool LayoutSimple(std::string_view text, SizedFont& sized, float fontSize, float dpi, const Sink* sink, TextLayout& result)
             {
                 FontFace& font = *sized.Font;
                 uint32_t size = uint32_t(text.size());
                 result = {};
-                // At most a glyph per byte: room for all of them up front keeps the loop free of checks.
-                Quads.Clear();
-                if (placeGlyphs && !Quads.Reserve(size))
-                    return true;
 
                 // Same arithmetic as DirectWrite (natural measuring mode): each advance, kerning included, is scaled
                 // to DIPs and accumulated; lines stack by the font's line box.
                 LineBox box = FontLineBox(font.Metrics, fontSize);
-                float unitsPerEm = float(font.Metrics.designUnitsPerEm);
+                float advanceScale = fontSize / float(font.Metrics.designUnitsPerEm);
+                float dipsPerPixel = 1 / dpi;
                 float x = 0, top = 0, width = 0;
                 int32_t previous = -1;  // SimpleIndex of the previous glyph, -1 at the start of a line or after a tab
                 int32_t advance = 0;    // its advance, design units, added to x with the kerning of the next glyph
                 Script run = Script::Common; // script of the line's current run, Common before its first letter
-                float baseline = Round(box.Above * dpi); // pixels
+                float baseline = SnapPixel(box.Above * dpi); // pixels
+                uint32_t count = 0;
+                ClipRect ink = EmptyBounds;
 
                 // UTF-8 decoded here: simple code points take at most three bytes. Anything else, including
                 // invalid UTF-8, goes to the shaping path.
@@ -791,7 +848,7 @@ namespace Funky
 
                     if (c == '\n' || c == '\t')
                     {
-                        x += float(advance) * fontSize / unitsPerEm;
+                        x += float(advance) * advanceScale;
                         previous = -1;
                         advance = 0;
                         if (c == '\t')
@@ -801,7 +858,7 @@ namespace Funky
                             width = Max(width, x);
                             x = 0;
                             top += box.Above + box.Below;
-                            baseline = Round((top + box.Above) * dpi);
+                            baseline = SnapPixel((top + box.Above) * dpi);
                             run = Script::Common;
                         }
                         continue;
@@ -814,40 +871,48 @@ namespace Funky
                     if (previous >= 0)
                     {
                         // No kerning across a change of script: DirectWrite shapes the runs apart.
-                        int16_t kerning = 0;
+                        int32_t kerning = 0;
                         if (script == Script::Common || run == Script::Common || script == run)
                         {
-                            kerning = PairKerning(font, uint16_t(previous), uint16_t(index));
+                            const int16_t* row = font.Kerning[previous];
+                            kerning = row ? row[index] : KernUnknown;
+                            if (kerning == KernUnknown)
+                                kerning = PairKerning(font, uint16_t(previous), uint16_t(index));
                             if (kerning == KernNeedsShaping)
                                 return false;
                         }
-                        x += float(advance + kerning) * fontSize / unitsPerEm;
+                        x += float(advance + kerning) * advanceScale;
                     }
                     if (script != Script::Common)
                         run = script;
-                    if (placeGlyphs)
+                    if (sink)
                     {
                         GlyphEntry& glyph = sized.Glyphs[index];
-                        if (glyph.Width == Unresolved)
+                        if (glyph.Texel0 == Unresolved)
                         {
                             GlyphEntry resolved;
                             if (!GetGlyph(font.Face, font.Simple[index].Index, sized.EmPixels, resolved))
                             {
-                                Quads.Clear();
+                                result = {};
                                 return true;
                             }
                             glyph = resolved;
                         }
-                        if (glyph.Width)
-                            Quads.Data[Quads.Count++] = PlaceGlyph(glyph, Round(x * dpi), baseline, dpi);
+                        if (glyph.Width != 0)
+                        {
+                            GlyphQuad q = PlaceGlyph(glyph, SnapPixel(x * dpi), baseline, dipsPerPixel);
+                            (*sink)(count++, q);
+                            AddInk(ink, q);
+                        }
                     }
                     previous = index;
                     advance = font.Simple[index].Advance;
                 }
-                x += float(advance) * fontSize / unitsPerEm;
-                result.GlyphCount = Quads.Count;
+                x += float(advance) * advanceScale;
+                result.GlyphCount = count;
                 result.Size = { Max(width, x), top + box.Above + box.Below };
                 result.Baseline = box.Above;
+                result.Ink = ink;
                 return true;
             }
 
@@ -1055,7 +1120,7 @@ namespace Funky
                         GlyphEntry glyph;
                         if (!GetGlyph(font.Face, run.Glyphs[i], font.EmSize * dpi, glyph))
                             return false;
-                        if (glyph.Width && !Quads.Push(PlaceGlyph(glyph, Round(glyphX * dpi), Round(baseline - offset.ascenderOffset * dpi), dpi)))
+                        if (glyph.Width != 0 && !Quads.Push(PlaceGlyph(glyph, Round(glyphX * dpi), Round(baseline - offset.ascenderOffset * dpi), 1 / dpi)))
                             return false;
                     }
                     x += run.Width;
@@ -1105,7 +1170,10 @@ namespace Funky
                     layout->GlyphCount = Quads.Count;
                     layout->Size = { width, top };
                     layout->Baseline = baseline;
+                    layout->Ink = EmptyBounds;
                     MemCopy(layout->Glyphs, Quads.Data, sizeof(GlyphQuad) * Quads.Count);
+                    for (const GlyphQuad& q : Quads)
+                        AddInk(layout->Ink, q);
                 }
                 return layout;
             }
@@ -1222,26 +1290,26 @@ namespace Funky
         if (!State || !(style.FontSize > 0) || !(dpiScale > 0))
             return &EmptyLayout;
         Impl& s = *State;
-
-        const FontFamily& family = s.Families[style.Font.Index < s.Families.Count ? style.Font.Index : 0];
-        uint64_t fontKey = HashCombine(HashCombine(family.Hash, uint32_t(style.FontWeight)), style.Italic);
-        SizedFont* sized = s.GetSized(fontKey, family, style, style.FontSize * dpiScale, scratch);
+        const FontFamily* family = nullptr;
+        uint64_t fontKey = 0;
+        SizedFont* sized = s.Resolve(style, dpiScale, scratch, family, fontKey);
         if (!sized)
             return &EmptyLayout;
 
-        TextLayout simple;
-        if (s.LayoutSimple(text, *sized, style.FontSize, dpiScale, true, simple))
+        // Simple text is laid out in place, valid until EndFrame: the header and room for a glyph per byte,
+        // trimmed to the glyphs placed.
+        TextLayout* layout = static_cast<TextLayout*>(s.FrameLayouts.Alloc(sizeof(TextLayout) + sizeof(GlyphQuad) * text.size()));
+        if (!layout)
+            return &EmptyLayout;
+        QuadSink quads = { reinterpret_cast<GlyphQuad*>(layout + 1) };
+        if (s.LayoutSimple(text, *sized, style.FontSize, dpiScale, &quads, *layout))
         {
-            // Header and exactly its quads, valid until EndFrame.
-            TextLayout* layout = static_cast<TextLayout*>(s.FrameLayouts.Alloc(sizeof(TextLayout) + sizeof(GlyphQuad) * simple.GlyphCount));
-            if (!layout)
-                return &EmptyLayout;
-            *layout = simple;
-            layout->Glyphs = reinterpret_cast<GlyphQuad*>(layout + 1);
-            MemCopy(layout->Glyphs, s.Quads.Data, sizeof(GlyphQuad) * simple.GlyphCount);
+            layout->Glyphs = quads.Out;
+            s.FrameLayouts.Trim(layout, sizeof(TextLayout) + sizeof(GlyphQuad) * layout->GlyphCount);
             return layout;
         }
-        const TextLayout* shaped = s.LayoutShaped(text, *sized, fontKey, family, style, dpiScale, scratch);
+        s.FrameLayouts.Trim(layout, 0);
+        const TextLayout* shaped = s.LayoutShaped(text, *sized, fontKey, *family, style, dpiScale, scratch);
         return shaped ? shaped : &EmptyLayout;
     }
 
@@ -1250,17 +1318,41 @@ namespace Funky
         if (!State || !(style.FontSize > 0) || !(dpiScale > 0))
             return {};
         Impl& s = *State;
-        const FontFamily& family = s.Families[style.Font.Index < s.Families.Count ? style.Font.Index : 0];
-        uint64_t fontKey = HashCombine(HashCombine(family.Hash, uint32_t(style.FontWeight)), style.Italic);
-        SizedFont* sized = s.GetSized(fontKey, family, style, style.FontSize * dpiScale, scratch);
+        const FontFamily* family = nullptr;
+        uint64_t fontKey = 0;
+        SizedFont* sized = s.Resolve(style, dpiScale, scratch, family, fontKey);
         if (!sized)
             return {};
         TextLayout measured;
-        if (s.LayoutSimple(text, *sized, style.FontSize, dpiScale, false, measured))
+        if (s.LayoutSimple(text, *sized, style.FontSize, dpiScale, static_cast<const QuadSink*>(nullptr), measured))
             return measured.Size;
         // Shaped text: its layout is cached and usually drawn right after.
-        const TextLayout* shaped = s.LayoutShaped(text, *sized, fontKey, family, style, dpiScale, scratch);
+        const TextLayout* shaped = s.LayoutShaped(text, *sized, fontKey, *family, style, dpiScale, scratch);
         return shaped ? shaped->Size : Vec2{};
+    }
+
+    const TextLayout* TextSystem::LayoutInto(std::string_view text, const TextStyle& style, float dpiScale, Arena& scratch,
+                                             const GlyphTarget& target, uint32_t& count, ClipRect& ink)
+    {
+        count = 0;
+        if (!State || !(style.FontSize > 0) || !(dpiScale > 0))
+            return nullptr;
+        Impl& s = *State;
+        const FontFamily* family = nullptr;
+        uint64_t fontKey = 0;
+        SizedFont* sized = s.Resolve(style, dpiScale, scratch, family, fontKey);
+        if (!sized)
+            return nullptr;
+        TextLayout result;
+        if (!s.LayoutSimple(text, *sized, style.FontSize, dpiScale, &target, result))
+        {
+            const TextLayout* shaped = s.LayoutShaped(text, *sized, fontKey, *family, style, dpiScale, scratch);
+            return shaped ? shaped : &EmptyLayout;
+        }
+        count = result.GlyphCount;
+        ink = { target.Origin.X + result.Ink.MinX, target.Origin.Y + result.Ink.MinY, target.Origin.X + result.Ink.MaxX,
+                target.Origin.Y + result.Ink.MaxY };
+        return nullptr;
     }
 
     bool TextSystem::TakeAtlasUpdate(AtlasUpdate& update)
@@ -1303,6 +1395,7 @@ namespace Funky
         if (!State)
             return;
         Impl& s = *State;
+        s.LastSized = nullptr; // may be freed by Sized.EndFrame below or the next one
         if (s.ResetPending)
             s.ResetAtlas();
         s.Shaped.EndFrame();

@@ -1,7 +1,9 @@
 // Built-in controls: Label, Button, CheckBox, Slider.
-// Uses only the public API (Widget, Transition, Draw*, MeasureText), exactly like a client's own control would.
+// Built on the public API (Widget, Transition, Draw*) like a client's own control, except for text: a control
+// lays its text out once, sizes itself by the layout and draws that same layout (MeasureText + DrawString
+// would lay it out twice).
 
-#include "Base.h"
+#include "Internal.h"
 
 namespace Funky
 {
@@ -105,7 +107,9 @@ namespace Funky
         style.Shadow.Color = WithOpacity(style.Shadow.Color, props.Opacity);
         style.Outline.Color = WithOpacity(style.Outline.Color, props.Opacity);
 
-        Vec2 size = MeasureText(text, style);
+        UiImpl& ui = *Impl(this);
+        const TextLayout& layout = ui.LayoutText(text, style);
+        Vec2 size = layout.Size;
         Funky::Widget w = Widget(Key(), {
             .Width = DesiredSize(props.Width, size.X),
             .Height = DesiredSize(props.Height, size.Y),
@@ -119,13 +123,15 @@ namespace Funky
             .MaxHeight = props.MaxHeight,
         });
 
-        DrawString({ w.Rect.X, w.Rect.CenterY() - size.Y * 0.5f }, text, style);
+        ui.DrawLayout({ w.Rect.X, w.Rect.CenterY() - size.Y * 0.5f }, layout, style);
     }
 
     bool Ui::Button(std::string_view text, const ButtonProps& props)
     {
+        UiImpl& ui = *Impl(this);
         TextStyle style = { .Font = props.Font, .FontSize = props.FontSize, .FontWeight = props.FontWeight, .Foreground = props.Foreground };
-        Vec2 textSize = MeasureText(text, style);
+        const TextLayout& layout = ui.LayoutText(text, style);
+        Vec2 textSize = layout.Size;
 
         Funky::Widget w = Widget(props.Key.IsNone() ? Key::FromString(text) : props.Key, {
             .Width = DesiredSize(props.Width, textSize.X + props.Padding.Horizontal()),
@@ -166,14 +172,16 @@ namespace Funky
         });
 
         style.Foreground = Fade(props.Foreground, opacity);
-        DrawString(w.Rect.Center() - textSize * 0.5f, text, style);
+        ui.DrawLayout(w.Rect.Center() - textSize * 0.5f, layout, style);
         return w.Clicked;
     }
 
     bool Ui::CheckBox(std::string_view text, bool& value, const CheckBoxProps& props)
     {
+        UiImpl& ui = *Impl(this);
         TextStyle style = { .Font = props.Font, .FontSize = props.FontSize, .FontWeight = props.FontWeight, .Foreground = props.Foreground };
-        Vec2 textSize = text.empty() ? Vec2() : MeasureText(text, style);
+        const TextLayout* layout = text.empty() ? nullptr : &ui.LayoutText(text, style);
+        Vec2 textSize = layout ? layout->Size : Vec2();
         float textOffset = text.empty() ? 0.0f : CheckBoxSpacing;
 
         Funky::Widget w = Widget(props.Key.IsNone() ? Key::FromPointer(&value) : props.Key, {
@@ -233,10 +241,10 @@ namespace Funky
             DrawPolyline({ points, count }, { .Stroke = Fade(props.CheckMark, opacity), .Thickness = props.BoxSize * CheckMarkThickness });
         }
 
-        if (!text.empty())
+        if (layout)
         {
             style.Foreground = Fade(props.Foreground, opacity);
-            DrawString({ box.Right() + textOffset, w.Rect.CenterY() - textSize.Y * 0.5f }, text, style);
+            ui.DrawLayout({ box.Right() + textOffset, w.Rect.CenterY() - textSize.Y * 0.5f }, *layout, style);
         }
         return w.Clicked;
     }

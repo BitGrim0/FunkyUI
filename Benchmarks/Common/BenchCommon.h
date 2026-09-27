@@ -902,7 +902,7 @@ namespace Bench
     class SceneBuilder
     {
     public:
-        SceneBuilder(FrameModel& model, uint32_t frame) : Model(model), Frame(frame) {}
+        SceneBuilder(FrameModel& model, uint32_t frame, uint32_t flipScale) : Model(model), Frame(frame), FlipScale(flipScale) {}
 
         // Panels cascade over the viewport at fixed positions; slider values, check boxes and the toggle change.
         void Panels(uint32_t count)
@@ -918,8 +918,8 @@ namespace Bench
                 for (int row = 0; row < RowCount; ++row)
                     p.Values[row] = 0.5f + 0.45f * float(std::sin(Frame * 0.03 + i * 0.7 + row * 0.45));
                 for (uint32_t c = 0; c < CheckCount; ++c)
-                    p.Checks[c] = (Frame + i * 7 + c * 13) / 40 % 2 == 1; // every 40 frames, staggered
-                p.Toggle = (Frame + i * 11) / 90 % 2 == 1;
+                    p.Checks[c] = (Frame + i * 7 + c * 13) / (40 * FlipScale) % 2 == 1; // every 40 frames (x FlipScale), staggered
+                p.Toggle = (Frame + i * 11) / (90 * FlipScale) % 2 == 1;
             }
         }
 
@@ -1177,14 +1177,20 @@ namespace Bench
 
         FrameModel& Model;
         uint32_t Frame;
+        uint32_t FlipScale;
     };
 
-    // rampCount: number of objects of the Ramp scene.
-    inline void GenerateFrame(const Scene& scene, uint32_t frame, double scale, uint32_t rampCount, FrameModel& model)
+    // Throughput runs about 25 times as many frames per second as a 100 Hz display, so check boxes and toggles
+    // flip 25 times less often per frame: about as often per second as in Display, like a user clicking. Flipped
+    // every 40 frames at ~2600 FPS (15 ms) they would never finish a transition. Both libraries get the same frames.
+    constexpr uint32_t ThroughputFlipScale = 25;
+
+    // rampCount: number of objects of the Ramp scene. flipScale: see ThroughputFlipScale.
+    inline void GenerateFrame(const Scene& scene, uint32_t frame, double scale, uint32_t rampCount, uint32_t flipScale, FrameModel& model)
     {
         model.Prims.clear();
         model.Panels.clear();
-        SceneBuilder b(model, scene.Frozen ? 0 : frame);
+        SceneBuilder b(model, scene.Frozen ? 0 : frame, flipScale);
         switch (scene.Id)
         {
             case SceneId::Idle:
@@ -1353,6 +1359,7 @@ namespace Bench
         double OtherCpuPercent = 0;         // the same without the frame loop thread (driver / runtime threads)
         double GpuPercent = -1;             // 3D engine of this process; < 0 = unavailable
         double GpuMs = -1;                  // display: GpuPercent x average frame interval; throughput: GpuFrameMs.Avg
+        double GpuBusyMs = -1;              // throughput: GpuPercent / LoopFps, the GPU's busy time per frame
         double HeadroomFps = 0;             // display: 1000 / max(CpuMs, GpuMs); throughput: Fps
         MemoryUsage Memory;                 // process, at the end of the scene
         double Vertices = 0;                // average per frame, where the library exposes them
@@ -1397,8 +1404,12 @@ namespace Bench
             "  Build       the UI code: after BeginFrame/NewFrame .. before EndFrame/Render, ms avg/p95/p99.\n"
             "  Submit      EndFrame, or Render + RenderDrawData + Present (throughput: + clear, timestamps, flush),\n"
             "              ms avg/p95/p99.\n"
-            "  GPU ms      throughput: GPU time of a frame avg/p95 from timestamps (clear .. last draw), exact;\n"
-            "              intervals with a GPU clock change (disjoint) are discarded. Display: GPU %% x frame interval.\n"
+            "  GPU ms      throughput: GPU time of a frame avg/p95 from timestamps (clear .. last draw); intervals\n"
+            "              with a GPU clock change (disjoint) are discarded. It includes the GPU waiting for the commands\n"
+            "              while the library renders on the CPU: * = CPU-bound (CPU frame > GPU ms), an upper bound - see\n"
+            "              GPU busy. Display: GPU %% x frame interval.\n"
+            "  GPU busy    throughput: GPU %% / Loop FPS, ms: what the frame keeps the GPU busy (PDH, ~16 ms ticks).\n"
+            "              Compare shader work by it, or by GPU ms in GPU-bound scenes.\n"
             "  GPU wait    throughput: the CPU spinning for the oldest frame in flight when all %d are in flight\n"
             "              (not in CPU Mcyc, CPU frame or FPS).\n"
             "  Proc CPU    display: CPU time of all threads of the process (incl. driver threads and scene\n"
@@ -1672,6 +1683,7 @@ namespace Bench
                 // CPU and GPU overlap when embedded: the slower of the two sets the frame rate.
                 r.LoopFps = frames * 1000.0 / loopMs;
                 r.GpuMs = r.GpuFrames > 0 ? r.GpuFrameMs.Avg : -1;
+                r.GpuBusyMs = gpuPercent < 0 ? -1 : gpuPercent / 100 * 1000 / r.LoopFps;
                 r.Fps = 1000 / std::max(r.IntervalMs.Avg, r.GpuMs);
                 r.HeadroomFps = r.Fps;
             }
@@ -1692,9 +1704,9 @@ namespace Bench
         {
             if (AbortRequested())
                 return false;
-            GenerateFrame(scene, frame, Opt.Scale, rampCount, Model); // not measured
-
             bool offscreen = mode == Mode::Throughput;
+            GenerateFrame(scene, frame, Opt.Scale, rampCount, offscreen ? ThroughputFlipScale : 1, Model); // not measured
+
             int64_t waitStart = Now();
             if (offscreen)
                 Target.WaitForSlot();
@@ -1744,7 +1756,7 @@ namespace Bench
                 Table timing(display ? std::vector<std::string>{ "Scene", "Items", "FPS", "Interval p50/95/99", "CPU Mcyc avg/p95", "CPU ms",
                                                                  "Proc CPU %", "GPU %", "GPU ms", "Headroom FPS" }
                                      : std::vector<std::string>{ "Scene", "Items", "FPS", "Loop FPS", "CPU frame ms p50/95/99", "CPU Mcyc avg/p95",
-                                                                 "CPU ms", "GPU ms avg/p95", "GPU wait ms", "Other CPU %", "GPU %" });
+                                                                 "CPU ms", "GPU ms avg/p95", "GPU busy ms", "GPU wait ms", "Other CPU %", "GPU %" });
                 std::vector<std::string> costHeader = { "Scene", "Build ms avg/p95/p99", "Submit ms avg/p95/p99", "WS MB", "Peak WS MB",
                                                         "Private MB", "GPU MB" };
                 if (drawCounts)
@@ -1763,8 +1775,8 @@ namespace Bench
                                      Fixed(r.ProcessCpuPercent, 1), OrDash(r.GpuPercent, 1), OrDash(r.GpuMs, 3), Fixed(r.HeadroomFps, 0) });
                     else
                         timing.Add({ r.Scene, std::to_string(r.Items), Fixed(r.Fps, 1), Fixed(r.LoopFps, 1), Percentiles(r.IntervalMs, 3), cycles,
-                                     Fixed(r.CpuMs, 3), GpuFrameText(r), Fixed(r.GpuWaitMs.Avg, 3), Fixed(r.OtherCpuPercent, 1),
-                                     OrDash(r.GpuPercent, 1) });
+                                     Fixed(r.CpuMs, 3), GpuFrameText(r), OrDash(r.GpuBusyMs, 3), Fixed(r.GpuWaitMs.Avg, 3),
+                                     Fixed(r.OtherCpuPercent, 1), OrDash(r.GpuPercent, 1) });
                     std::vector<std::string> row = { r.Scene, AvgPercentiles(r.BuildMs, 3), AvgPercentiles(r.SubmitMs, 3),
                                                      Megabytes(r.Memory.WorkingSet), Megabytes(r.Memory.PeakWorkingSet),
                                                      Megabytes(r.Memory.Private), OrDash(GpuLocalMb(r.Memory), 1) };
@@ -1822,7 +1834,10 @@ namespace Bench
 
         static std::string GpuFrameText(const SceneResult& r)
         {
-            return r.GpuFrames > 0 ? Format("%.3f/%.3f", r.GpuFrameMs.Avg, r.GpuFrameMs.P95) : std::string("-");
+            if (r.GpuFrames == 0)
+                return "-";
+            bool cpuBound = r.IntervalMs.Avg > r.GpuFrameMs.Avg; // the interval includes GPU idle: an upper bound
+            return Format("%.3f/%.3f%s", r.GpuFrameMs.Avg, r.GpuFrameMs.P95, cpuBound ? "*" : "");
         }
 
         std::string CsvLine(const SceneResult& r) const
@@ -1830,8 +1845,8 @@ namespace Bench
             // Throughput-only columns are -1 in display rows.
             const Distribution& g = r.GpuFrameMs;
             bool gpu = r.GpuFrames > 0;
-            std::string extra = Format(",%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%d\n", r.LoopFps, gpu ? g.Avg : -1, gpu ? g.P50 : -1, gpu ? g.P95 : -1,
-                                       gpu ? g.P99 : -1, gpu ? g.Max : -1, r.Mode == Mode::Display ? -1 : r.GpuFrames);
+            std::string extra = Format(",%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.4f\n", r.LoopFps, gpu ? g.Avg : -1, gpu ? g.P50 : -1, gpu ? g.P95 : -1,
+                                       gpu ? g.P99 : -1, gpu ? g.Max : -1, r.Mode == Mode::Display ? -1 : r.GpuFrames, r.GpuBusyMs);
             return Format("%s,%s,%s,%s,%llu,%d,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.4f,"
                           "%.1f,%.2f,%.2f,%.2f,%.2f,%.0f,%.0f",
                           Lib.Name(), Lib.Version().c_str(), ModeName(r.Mode), r.Scene.c_str(), (unsigned long long)r.Items, r.Frames, r.Fps,
@@ -1853,7 +1868,7 @@ namespace Bench
                                "interval_max_ms,cpu_mcycles_avg,cpu_mcycles_p95,cpu_ms,build_avg_ms,build_p95_ms,build_p99_ms,submit_avg_ms,"
                                "submit_p95_ms,submit_p99_ms,gpu_wait_avg_ms,process_cpu_pct,other_cpu_pct,gpu_pct,gpu_ms,headroom_fps,working_set_mb,"
                                "peak_working_set_mb,private_mb,gpu_local_mb,vertices,indices,loop_fps,gpu_frame_avg_ms,gpu_frame_p50_ms,"
-                               "gpu_frame_p95_ms,gpu_frame_p99_ms,gpu_frame_max_ms,gpu_frames\n";
+                               "gpu_frame_p95_ms,gpu_frame_p99_ms,gpu_frame_max_ms,gpu_frames,gpu_busy_ms\n";
             for (const SceneResult& r : Results)
                 text += CsvLine(r);
             for (const SceneResult& r : RampSteps)

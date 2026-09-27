@@ -69,67 +69,93 @@ namespace Funky
             return { area.X + (area.Width - size.X) * column, area.Y + (area.Height - size.Y) * row };
         }
 
-        // Moves the transition stored under key towards value[0..count) and writes its current value back.
-        void Animate(UiImpl& ui, uint64_t key, float* value, uint32_t count, float duration)
+        // How each Transition type is stored: the target's bits (exact at rest) and the floats it blends as.
+        template <class T>
+        struct Blended;
+
+        template <>
+        struct Blended<float>
         {
+            static constexpr uint32_t Count = 1;
+            static uint64_t Bits(float v) { return std::bit_cast<uint32_t>(v); }
+            static float FromBits(uint64_t bits) { return std::bit_cast<float>(uint32_t(bits)); }
+            static void ToFloats(float v, float* out) { out[0] = v; }
+            static float FromFloats(const float* v) { return v[0]; }
+        };
+
+        template <>
+        struct Blended<Vec2>
+        {
+            static constexpr uint32_t Count = 2;
+            static uint64_t Bits(Vec2 v) { return std::bit_cast<uint32_t>(v.X) | uint64_t(std::bit_cast<uint32_t>(v.Y)) << 32; }
+            static Vec2 FromBits(uint64_t bits) { return { std::bit_cast<float>(uint32_t(bits)), std::bit_cast<float>(uint32_t(bits >> 32)) }; }
+            static void ToFloats(Vec2 v, float* out) { out[0] = v.X; out[1] = v.Y; }
+            static Vec2 FromFloats(const float* v) { return { v[0], v[1] }; }
+        };
+
+        // Colors move as premultiplied linear RGBA, like Lerp(Color, Color, float).
+        template <>
+        struct Blended<Color>
+        {
+            static constexpr uint32_t Count = 4;
+            static uint64_t Bits(Color c) { return c.A ? PackColor(c) : 0; } // every transparent color is one target
+            static Color FromBits(uint64_t bits) { return { uint8_t(bits), uint8_t(bits >> 8), uint8_t(bits >> 16), uint8_t(bits >> 24) }; }
+
+            static void ToFloats(Color c, float* out) { ToPremultipliedLinear(c, out); }
+            static Color FromFloats(const float* v) { return FromPremultipliedLinear(v); }
+        };
+
+        // Ease-out cubic from From to To at s.Progress.
+        void Blend(const TransitionState& s, uint32_t count, float* out)
+        {
+            float u = 1 - s.Progress;
+            float eased = 1 - u * u * u;
+            for (uint32_t i = 0; i < count; ++i)
+                out[i] = s.From[i] * (1 - eased) + s.To[i] * eased;
+        }
+
+        // Moves the transition stored under key towards target (advancing at most once per frame) and returns
+        // its current value. A new transition, or one with no duration, is at its target right away.
+        template <class T>
+        T AnimateValue(UiImpl& ui, uint64_t key, T target, Duration duration)
+        {
+            using B = Blended<T>;
             bool isNew = false;
             TransitionState* s = ui.Transitions.FindOrAdd(key, &isNew);
             if (!s)
-                return; // out of memory: the target is returned as is
-            size_t bytes = sizeof(float) * count;
-
-            if (isNew || duration <= 0)
+                return target; // out of memory: no animation
+            uint64_t bits = B::Bits(target);
+            if (isNew || duration.Seconds <= 0)
             {
-                MemCopy(s->From, value, bytes);
-                MemCopy(s->To, value, bytes);
-                MemCopy(s->Current, value, bytes);
-                s->Elapsed = 0;
+                s->Target = bits;
+                s->Progress = 1;
+                s->LastFrame = ui.FrameIndex;
+                return target;
             }
-            else
+            if (bits != s->Target)
             {
-                if (!MemEqual(s->To, value, bytes))
-                {
-                    MemCopy(s->From, s->Current, bytes);
-                    MemCopy(s->To, value, bytes);
-                    s->Elapsed = 0;
-                }
-                if (s->LastFrame != ui.FrameIndex)
-                {
-                    s->Elapsed = Min(s->Elapsed + ui.Dt, duration);
-                    float u = 1 - s->Elapsed / duration;
-                    float eased = 1 - u * u * u;
-                    for (uint32_t i = 0; i < count; ++i)
-                        s->Current[i] = s->From[i] * (1 - eased) + s->To[i] * eased; // exactly To when done
-                }
+                // A new target: move on from where the value is now.
+                float current[4];
+                if (s->Progress >= 1)
+                    B::ToFloats(B::FromBits(s->Target), current);
+                else
+                    Blend(*s, B::Count, current);
+                MemCopy(s->From, current, sizeof(float) * B::Count);
+                B::ToFloats(target, s->To);
+                s->Target = bits;
+                s->Progress = 0;
             }
-            s->Duration = duration;
-            s->LastFrame = ui.FrameIndex;
-            MemCopy(value, s->Current, bytes);
-        }
-
-        float AnimateValue(UiImpl& ui, uint64_t key, float target, Duration duration)
-        {
-            Animate(ui, key, &target, 1, duration.Seconds);
-            return target;
-        }
-
-        Vec2 AnimateValue(UiImpl& ui, uint64_t key, Vec2 target, Duration duration)
-        {
-            float value[2] = { target.X, target.Y };
-            Animate(ui, key, value, 2, duration.Seconds);
-            return { value[0], value[1] };
-        }
-
-        // Colors move as premultiplied linear RGBA, like Lerp(Color, Color, float).
-        Color AnimateValue(UiImpl& ui, uint64_t key, Color target, Duration duration)
-        {
-            LinearColor c = ToLinear(target);
-            float value[4] = { c.R * c.A, c.G * c.A, c.B * c.A, c.A };
-            Animate(ui, key, value, 4, duration.Seconds);
-            if (value[3] <= 0)
-                return Colors::Transparent;
-            float inverse = 1 / value[3];
-            return FromLinear({ value[0] * inverse, value[1] * inverse, value[2] * inverse, value[3] });
+            if (s->LastFrame != ui.FrameIndex)
+            {
+                s->LastFrame = ui.FrameIndex;
+                if (s->Progress < 1)
+                    s->Progress = Min(s->Progress + ui.Dt / duration.Seconds, 1.0f);
+            }
+            if (s->Progress >= 1)
+                return target; // at rest: exactly the target
+            float value[4];
+            Blend(*s, B::Count, value);
+            return B::FromFloats(value);
         }
 
         void ReadInput(UiImpl& ui)
@@ -158,7 +184,7 @@ namespace Funky
         {
             if (!ui.Runs.IsEmpty() && ui.Runs.Back().Layer == ui.CurrentLayer && ui.Runs.Back().Kind == kind)
                 return &ui.Runs.Back();
-            return ui.Runs.Push({ ui.CurrentLayer, kind, first, 0, { NoClip, NoClip, -NoClip, -NoClip } });
+            return ui.Runs.Push({ ui.CurrentLayer, kind, first, 0, EmptyBounds });
         }
 
         // Appends a batch to a list, merging it into the last one when it continues that one.
@@ -188,7 +214,7 @@ namespace Funky
                 uint32_t start = first;
                 for (uint32_t i = first; i < first + count && TextCount > 0; ++i)
                 {
-                    if (OverlapsText(shapes[i].Bounds))
+                    if (Overlaps(shapes[i].Bounds, TextUnion) && OverlapsText(shapes[i].Bounds))
                     {
                         Emit({ BatchShapes, start, i - start, opacity });
                         EndLevel();
@@ -203,6 +229,8 @@ namespace Funky
                 if (TextCount == MaxLevelTexts)
                     EndLevel(); // bounds the overlap tests per shape
                 Texts[TextCount++] = bounds;
+                TextUnion = { Min(TextUnion.MinX, bounds.MinX), Min(TextUnion.MinY, bounds.MinY),
+                              Max(TextUnion.MaxX, bounds.MaxX), Max(TextUnion.MaxY, bounds.MaxY) };
                 AddBatch(Glyphs, GlyphCount, { BatchGlyphs, first, count, opacity });
             }
 
@@ -211,20 +239,23 @@ namespace Funky
                 for (uint32_t i = 0; i < GlyphCount; ++i)
                     Emit(Glyphs[i]);
                 TextCount = GlyphCount = 0;
+                TextUnion = EmptyBounds;
             }
 
         private:
             static constexpr uint32_t MaxLevelTexts = 32;
 
             // Touching counts as overlapping: a pixel on the shared edge must keep its order.
+            static bool Overlaps(const float* bounds, const ClipRect& t)
+            {
+                return bounds[0] <= t.MaxX && t.MinX <= bounds[2] && bounds[1] <= t.MaxY && t.MinY <= bounds[3];
+            }
+
             bool OverlapsText(const float* bounds) const
             {
                 for (uint32_t i = 0; i < TextCount; ++i)
-                {
-                    const ClipRect& t = Texts[i];
-                    if (bounds[0] <= t.MaxX && t.MinX <= bounds[2] && bounds[1] <= t.MaxY && t.MinY <= bounds[3])
+                    if (Overlaps(bounds, Texts[i]))
                         return true;
-                }
                 return false;
             }
 
@@ -238,49 +269,62 @@ namespace Funky
             Array<DrawBatch>& Batches;
             ClipRect Texts[MaxLevelTexts];      // bounds of the level's glyph runs
             DrawBatch Glyphs[MaxLevelTexts];    // the level's glyph batches, drawn after its shapes
+            ClipRect TextUnion = EmptyBounds;   // of Texts: most shapes are rejected by this one test
             uint32_t TextCount = 0;
             uint32_t GlyphCount = 0;
         };
 
-        // XXH64's lane round: the data word is multiplied off the dependency chain.
-        constexpr uint64_t HashPrime1 = 0x9E3779B185EBCA87ull;
-        constexpr uint64_t HashPrime2 = 0xC2B2AE3D27D4EB4Full;
-
-        uint64_t HashRound(uint64_t lane, const uint8_t* word)
+        // The counts are compared first (see IsSameFrame).
+        template <class T>
+        bool SameData(const Array<T>& a, const Array<T>& b)
         {
-            uint64_t w;
-            MemCopy(&w, word, 8);
-            return std::rotl(lane + w * HashPrime2, 31) * HashPrime1;
+            return MemEqual(a.Data, b.Data, sizeof(T) * a.Count);
         }
 
-        // Presents the frame unless it is identical to the last presented one. An embedded target is
-        // redrawn by the client every frame, so it always gets the UI.
-        void Present(UiImpl& ui, uint64_t hash)
+        template <class T>
+        void Swap(T& a, T& b)
+        {
+            T t = a;
+            a = b;
+            b = t;
+        }
+
+        // Presents the frame unless it equals the last one (overlay). Any frame that is not presented for
+        // another reason forces the next one, so "equal to the last frame" always means "already on screen".
+        // An embedded target is redrawn by the client every frame, so it always gets the UI.
+        void Present(UiImpl& ui)
         {
             if (!ui.Embedded)
             {
                 ui.PresentedLastFrame = false;
-                if (!ui.Window.IsVisible() || (hash == ui.LastFrameHash && !ui.ForceRedraw))
+                if (!ui.Window.IsVisible())
+                {
+                    ui.ForceRedraw = true;
+                    return;
+                }
+                if (!ui.ForceRedraw && ui.IsSameFrame())
                     return;
             }
             FrameData frame = { ui.Shapes.Data, ui.Shapes.Count, ui.Glyphs.Data, ui.Glyphs.Count, ui.Points.Data, ui.Points.Count,
                                 ui.Clips.Data, ui.Clips.Count, ui.Batches.Data, ui.Batches.Count, ui.Scale };
             ui.PresentedLastFrame = ui.Gpu.Render(frame);
-            if (ui.PresentedLastFrame)
-            {
-                ui.LastFrameHash = hash;
-                ui.ForceRedraw = false;
-            }
+            ui.ForceRedraw = !ui.PresentedLastFrame;
         }
 
+        // Every MaxUnseenFrames frames: state unseen for that long is dropped (so it lives 8 to 16 frames).
         void CollectGarbage(UiImpl& ui)
         {
             uint32_t frame = ui.FrameIndex;
+            if (frame % MaxUnseenFrames != 0)
+                return;
             auto stale = [frame](uint32_t lastFrame) { return frame - lastFrame > MaxUnseenFrames; };
             ui.ContainerStates.RemoveIf([&](uint64_t, const ContainerState& s) { return stale(s.LastFrame); });
             ui.Transitions.RemoveIf([&](uint64_t, const TransitionState& s) { return stale(s.LastFrame); });
             // A dragged panel keeps its position for the whole session.
             ui.Panels.RemoveIf([&](uint64_t, const PanelState& s) { return stale(s.LastFrame) && !s.Dragged; });
+            ui.ContainerStates.ShrinkIfSparse();
+            ui.Transitions.ShrinkIfSparse();
+            ui.Panels.ShrinkIfSparse();
             for (uint32_t i = 0; i < ui.PanelOrder.Count;)
             {
                 if (ui.Panels.Find(ui.PanelOrder[i]))
@@ -366,6 +410,11 @@ namespace Funky
         Clips.Free();
         Points.Free();
         Batches.Free();
+        PreviousShapes.Free();
+        PreviousGlyphs.Free();
+        PreviousClips.Free();
+        PreviousPoints.Free();
+        PreviousBatches.Free();
         Frame.Free();
         Scratch.Free();
     }
@@ -383,6 +432,15 @@ namespace Funky
             ui.Window.WaitForFrame(ui.Gpu.FrameWaitable(), ui.PresentedLastFrame);
             if (!ui.Window.Update())
                 return false;
+
+            // The last frame becomes the previous one; its buffers are reused for this one.
+            Swap(ui.Shapes, ui.PreviousShapes);
+            Swap(ui.Glyphs, ui.PreviousGlyphs);
+            Swap(ui.Clips, ui.PreviousClips);
+            Swap(ui.Points, ui.PreviousPoints);
+            Swap(ui.Batches, ui.PreviousBatches);
+            ui.PreviousViewport = ui.Viewport;
+            ui.PreviousScale = ui.Scale;
 
             uint32_t width = Max(ui.Window.Width(), 1u);
             uint32_t height = Max(ui.Window.Height(), 1u);
@@ -411,8 +469,6 @@ namespace Funky
         ui.Clips.Clear();
         ui.Clips.Push({ -NoClip, -NoClip, NoClip, NoClip });
         ui.Points.Clear();
-        ui.Hash.Reset();
-        ui.HashedShapes = ui.HashedGlyphs = ui.HashedPoints = ui.HashedClips = 0;
         ui.CurrentClip = 0;
         ui.CurrentLayer = 0;
         ui.WidgetHoveredThisFrame = false;
@@ -447,19 +503,6 @@ namespace Funky
 
         FK_PROFILE(FrameProfile& profile = ui.Gpu.Profile(); profile = {}; int64_t buildStart = ProfileTicks();)
         ui.BuildFrame();
-        // The frame's content was folded into the hash as it was emitted; the paint order, the panels'
-        // opacity (both in the batches), the counts and the viewport complete it. Embedded never skips.
-        uint64_t hash = 0;
-        if (!ui.Embedded)
-        {
-            ui.FoldEmitted();
-            float view[4] = { ui.Viewport.X, ui.Viewport.Y, ui.Scale, 0 };
-            uint32_t counts[4] = { ui.Shapes.Count, ui.Glyphs.Count, ui.Points.Count, ui.Clips.Count };
-            ui.Hash.Fold(ui.Batches.Data, sizeof(DrawBatch) * ui.Batches.Count);
-            ui.Hash.Fold(view, sizeof(view));
-            ui.Hash.Fold(counts, sizeof(counts));
-            hash = ui.Hash.Finish();
-        }
         FK_PROFILE(profile.Build = ProfileTicks() - buildStart;)
 
         // A recreated device starts without the atlas; a changed atlas changes the pixels.
@@ -474,7 +517,7 @@ namespace Funky
             ui.Gpu.UpdateAtlas(atlas);
             ui.ForceRedraw = true;
         }
-        Present(ui, hash);
+        Present(ui);
         CollectGarbage(ui);
         ui.Text.EndFrame();
     }
@@ -511,53 +554,14 @@ namespace Funky
         batcher.EndLevel();
     }
 
-    // ------------------------------------------------------------------------------------
-    // Frame hash (XXH64-style: four independent lanes keep the multipliers busy)
-    // ------------------------------------------------------------------------------------
-
-    void FrameHash::Reset()
+    // Everything that decides the pixels: the viewport, the paint order with the panels' opacity (both in
+    // the batches) and the instance data. A changed frame usually differs within the first bytes.
+    bool UiImpl::IsSameFrame() const
     {
-        Lanes[0] = HashPrime1 + HashPrime2;
-        Lanes[1] = HashPrime2;
-        Lanes[2] = 0;
-        Lanes[3] = 0 - HashPrime1;
-    }
-
-    void FrameHash::Fold(const void* data, size_t size)
-    {
-        FK_ASSERT(size % 8 == 0);
-        const uint8_t* p = static_cast<const uint8_t*>(data);
-        const uint8_t* end = p + size;
-        uint64_t a = Lanes[0], b = Lanes[1], c = Lanes[2], d = Lanes[3];
-        for (; end - p >= 32; p += 32)
-        {
-            a = HashRound(a, p);
-            b = HashRound(b, p + 8);
-            c = HashRound(c, p + 16);
-            d = HashRound(d, p + 24);
-        }
-        // Up to three words left: they go to the first lanes (the split is the same for the same frame).
-        if (p < end)
-            a = HashRound(a, p);
-        if (p + 8 < end)
-            b = HashRound(b, p + 8);
-        if (p + 16 < end)
-            c = HashRound(c, p + 16);
-        Lanes[0] = a;
-        Lanes[1] = b;
-        Lanes[2] = c;
-        Lanes[3] = d;
-    }
-
-    uint64_t FrameHash::Finish() const
-    {
-        uint64_t h = std::rotl(Lanes[0], 1) + std::rotl(Lanes[1], 7) + std::rotl(Lanes[2], 12) + std::rotl(Lanes[3], 18);
-        h ^= h >> 33;
-        h *= 0xFF51AFD7ED558CCDull;
-        h ^= h >> 33;
-        h *= 0xC4CEB9FE1A85EC53ull;
-        h ^= h >> 33;
-        return h;
+        return Viewport == PreviousViewport && Scale == PreviousScale && Batches.Count == PreviousBatches.Count &&
+               Clips.Count == PreviousClips.Count && Points.Count == PreviousPoints.Count && Shapes.Count == PreviousShapes.Count &&
+               Glyphs.Count == PreviousGlyphs.Count && SameData(Batches, PreviousBatches) && SameData(Clips, PreviousClips) &&
+               SameData(Points, PreviousPoints) && SameData(Shapes, PreviousShapes) && SameData(Glyphs, PreviousGlyphs);
     }
 
 #if defined(FUNKY_PROFILE)
@@ -627,45 +631,35 @@ namespace Funky
 
     GpuShape* UiImpl::EmitShapes(uint32_t count)
     {
-        FoldEmitted();
         DrawRun* run = CurrentRun(*this, BatchShapes, Shapes.Count);
         GpuShape* shapes = run ? Shapes.Append(count) : nullptr;
         if (!shapes)
             return nullptr;
         run->Count += count;
-        MemZero(shapes, sizeof(GpuShape) * count);
+        // Zeroed per element: fixed-size stores, no memset call.
         for (uint32_t i = 0; i < count; ++i)
+        {
+            shapes[i] = GpuShape{};
             shapes[i].TypeFlags = CurrentClip << ShapeClipShift;
+        }
         return shapes;
     }
 
-    GpuGlyph* UiImpl::EmitGlyphs(uint32_t count, const ClipRect& bounds)
+    GpuGlyph* UiImpl::ReserveGlyphs(uint32_t count)
     {
-        FoldEmitted();
-        DrawRun* run = CurrentRun(*this, BatchGlyphs, Glyphs.Count);
-        GpuGlyph* glyphs = run ? Glyphs.Append(count) : nullptr;
-        if (!glyphs)
-            return nullptr;
+        return Glyphs.Reserve(Glyphs.Count + count) ? Glyphs.Data + Glyphs.Count : nullptr;
+    }
+
+    void UiImpl::CommitGlyphs(uint32_t count, const ClipRect& bounds)
+    {
+        FK_ASSERT(Glyphs.Count + count <= Glyphs.Capacity);
+        DrawRun* run = count ? CurrentRun(*this, BatchGlyphs, Glyphs.Count) : nullptr;
+        if (!run)
+            return;
+        Glyphs.Count += count;
         run->Count += count;
         run->Bounds = { Min(run->Bounds.MinX, bounds.MinX), Min(run->Bounds.MinY, bounds.MinY),
                         Max(run->Bounds.MaxX, bounds.MaxX), Max(run->Bounds.MaxY, bounds.MaxY) };
-        return glyphs;
-    }
-
-    // Called before every emission, so it hashes what the previous one wrote: still in the cache, and
-    // complete (nothing is changed after the next emission).
-    void UiImpl::FoldEmitted()
-    {
-        if (Embedded)
-            return;
-        Hash.Fold(Shapes.Data + HashedShapes, sizeof(GpuShape) * (Shapes.Count - HashedShapes));
-        Hash.Fold(Glyphs.Data + HashedGlyphs, sizeof(GpuGlyph) * (Glyphs.Count - HashedGlyphs));
-        Hash.Fold(Points.Data + HashedPoints, sizeof(Vec2) * (Points.Count - HashedPoints));
-        Hash.Fold(Clips.Data + HashedClips, sizeof(ClipRect) * (Clips.Count - HashedClips));
-        HashedShapes = Shapes.Count;
-        HashedGlyphs = Glyphs.Count;
-        HashedPoints = Points.Count;
-        HashedClips = Clips.Count;
     }
 
     void UiImpl::SetLayer(uint64_t layer)
@@ -783,7 +777,8 @@ namespace Funky
         state->LastFrame = ui.FrameIndex;
         bool sizing = state->FirstFrame == ui.FrameIndex;
 
-        Vec2 title = props.Title.empty() ? Vec2{} : MeasureText(props.Title, PanelTitleStyle);
+        const TextLayout* titleLayout = props.Title.empty() ? nullptr : &ui.LayoutText(props.Title, PanelTitleStyle);
+        Vec2 title = titleLayout ? titleLayout->Size : Vec2{};
         float titleBar = props.Title.empty() ? 0 : title.Y + props.Spacing;
 
         // Explicit or last frame's measured size, rounded out to whole pixels.
@@ -828,7 +823,7 @@ namespace Funky
         panel.Movable = props.Movable;
         if (!props.Title.empty())
         {
-            DrawString(panel.Content.Position(), props.Title, PanelTitleStyle);
+            ui.DrawLayout(panel.Content.Position(), *titleLayout, PanelTitleStyle);
             panel.Content.Y += titleBar;
             panel.Content.Height -= titleBar;
             panel.Measured.X = title.X;

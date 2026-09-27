@@ -263,16 +263,32 @@ namespace Funky
         return { byte(LinearToSrgb(Saturate(c.R))), byte(LinearToSrgb(Saturate(c.G))), byte(LinearToSrgb(Saturate(c.B))), byte(c.A) };
     }
 
+    void ToPremultipliedLinear(Color color, float* out)
+    {
+        LinearColor c = ToLinear(color);
+        out[0] = c.R * c.A;
+        out[1] = c.G * c.A;
+        out[2] = c.B * c.A;
+        out[3] = c.A;
+    }
+
+    Color FromPremultipliedLinear(const float* v)
+    {
+        float alpha = v[3];
+        if (alpha <= 0)
+            return Colors::Transparent;
+        return FromLinear({ v[0] / alpha, v[1] / alpha, v[2] / alpha, alpha });
+    }
+
     // Premultiplied, like the shader's gradients: fading to or from transparent does not darken.
     Color Lerp(Color a, Color b, float t)
     {
-        LinearColor x = ToLinear(a);
-        LinearColor y = ToLinear(b);
-        float alpha = Lerp(x.A, y.A, t);
-        if (alpha <= 0)
-            return Colors::Transparent;
-        auto channel = [&](float p, float q) { return Lerp(p * x.A, q * y.A, t) / alpha; };
-        return FromLinear({ channel(x.R, y.R), channel(x.G, y.G), channel(x.B, y.B), alpha });
+        float x[4], y[4], mixed[4];
+        ToPremultipliedLinear(a, x);
+        ToPremultipliedLinear(b, y);
+        for (int i = 0; i < 4; ++i)
+            mixed[i] = Lerp(x[i], y[i], t);
+        return FromPremultipliedLinear(mixed);
     }
 
     // ------------------------------------------------------------------------------------

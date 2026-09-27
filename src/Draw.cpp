@@ -113,7 +113,8 @@ namespace Funky
             return { lo.X, lo.Y, hi.X - lo.X, hi.Y - lo.Y };
         }
 
-        // Rectangles and circles: an optional shadow instance, then the body (fill, inner stroke, glow).
+        // Rectangles and circles: the body (fill, inner stroke, glow) and its shadow. Under a solid body the shadow
+        // is in the body's instance (the pixel shader composites it underneath); otherwise it is an instance of its own.
         void EmitRoundRect(UiImpl& ui, Rect rect, CornerRadius radius, const ShapeStyle& style)
         {
             if (!(rect.Width > 0 && rect.Height > 0))
@@ -124,20 +125,25 @@ namespace Funky
             float aa = 1 / ui.Scale;
 
             const Shadow& shadow = style.Shadow;
-            if (shadow.Color.A != 0 && (shadow.Blur > 0 || shadow.Offset.X != 0 || shadow.Offset.Y != 0))
+            bool hasShadow = shadow.Color.A != 0 && (shadow.Blur > 0 || shadow.Offset.X != 0 || shadow.Offset.Y != 0);
+            bool stroke = !style.Stroke.IsNone() && style.StrokeThickness > 0;
+            bool hasBody = !style.Fill.IsNone() || stroke || HasGlow(style.Glow);
+            bool merged = hasShadow && hasBody && style.Fill.Type != Brush::Kind::LinearGradient; // P2 holds the gradient
+            Rect shadowRect = { rect.X + shadow.Offset.X, rect.Y + shadow.Offset.Y, rect.Width, rect.Height };
+            float sigma = Max(shadow.Blur, 0.0f) * 0.5f; // Gaussian
+            float shadowPad = 3 * sigma + aa;
+
+            if (hasShadow && !merged)
             {
                 if (GpuShape* s = ui.EmitShapes(1))
                 {
-                    Rect r = { rect.X + shadow.Offset.X, rect.Y + shadow.Offset.Y, rect.Width, rect.Height };
-                    SetRoundRect(*s, r, radii);
+                    SetRoundRect(*s, shadowRect, radii);
                     s->Fill0 = PackColor(shadow.Color);
-                    s->Softness = Max(shadow.Blur, 0.0f) * 0.5f; // Gaussian sigma
-                    SetBounds(*s, r.Left(), r.Top(), r.Right(), r.Bottom(), 3 * s->Softness + aa);
+                    s->Softness = sigma;
+                    SetBounds(*s, shadowRect.Left(), shadowRect.Top(), shadowRect.Right(), shadowRect.Bottom(), shadowPad);
                 }
             }
-
-            bool stroke = !style.Stroke.IsNone() && style.StrokeThickness > 0;
-            if (style.Fill.IsNone() && !stroke && !HasGlow(style.Glow))
+            if (!hasBody)
                 return;
             GpuShape* s = ui.EmitShapes(1);
             if (!s)
@@ -151,6 +157,18 @@ namespace Funky
             }
             float glow = ApplyGlow(*s, style.Glow);
             SetBounds(*s, rect.Left(), rect.Top(), rect.Right(), rect.Bottom(), glow + aa);
+            if (merged)
+            {
+                s->TypeFlags |= FlagShadow;
+                s->Fill1 = PackColor(shadow.Color);
+                s->P2[0] = shadow.Offset.X;
+                s->P2[1] = shadow.Offset.Y;
+                s->P2[2] = sigma;
+                s->Bounds[0] = Min(s->Bounds[0], shadowRect.Left() - shadowPad);
+                s->Bounds[1] = Min(s->Bounds[1], shadowRect.Top() - shadowPad);
+                s->Bounds[2] = Max(s->Bounds[2], shadowRect.Right() + shadowPad);
+                s->Bounds[3] = Max(s->Bounds[3], shadowRect.Bottom() + shadowPad);
+            }
         }
 
         // The points go to UiImpl::Points; the shader takes the distance to the nearest segment of the
@@ -165,7 +183,7 @@ namespace Funky
             Vec2* stored = ui.Points.Append(count);
             if (!stored)
                 return;
-            MemCopy(stored, points, sizeof(Vec2) * count); // before EmitShapes, which hashes them (see FoldEmitted)
+            MemCopy(stored, points, sizeof(Vec2) * count);
             uint32_t instances = (count - 2) / MaxPolylineSegments + 1;
             GpuShape* shapes = ui.EmitShapes(instances);
             if (!shapes)
@@ -230,11 +248,51 @@ namespace Funky
         s->P0[1] = center.Y;
         s->P0[2] = radius;
         s->P0[3] = half;
-        s->P1[0] = startAngle * (Pi / 180);
+        // Wrapped: an angle that grows without bound (a spinner) keeps its precision on the CPU and the GPU.
+        s->P1[0] = (startAngle - Floor(startAngle * (1.0f / 360)) * 360) * (Pi / 180);
         s->P1[1] = sweepAngle * (Pi / 180);
         ApplyPaint(*s, MakePaint(style.Stroke, { center.X - radius, center.Y - radius, 2 * radius, 2 * radius }));
-        float pad = radius + half + ApplyGlow(*s, style.Glow) + 1 / ui.Scale;
-        SetBounds(*s, center.X, center.Y, center.X, center.Y, pad);
+
+        // Tight box of the centerline: its ends and the axis directions it passes; the caps and the stroke are
+        // within half of it.
+        float lo[2] = { center.X + radius, center.Y }, hi[2] = { center.X + radius, center.Y }; // any point on it
+        float first = s->P1[0], last = s->P1[0] + s->P1[1];
+        if (last < first)
+        {
+            float t = first;
+            first = last;
+            last = t;
+        }
+        auto include = [&](float x, float y)
+        {
+            lo[0] = Min(lo[0], x);
+            lo[1] = Min(lo[1], y);
+            hi[0] = Max(hi[0], x);
+            hi[1] = Max(hi[1], y);
+        };
+        if (last - first >= 2 * Pi)
+        {
+            include(center.X - radius, center.Y - radius);
+            include(center.X + radius, center.Y + radius);
+        }
+        else
+        {
+            lo[0] = hi[0] = center.X + radius * Cos(first);
+            lo[1] = hi[1] = center.Y + radius * Sin(first);
+            include(center.X + radius * Cos(last), center.Y + radius * Sin(last));
+            // Directions k * 90 degrees (+X, +Y, -X, -Y) within [first, last].
+            constexpr float Quarter = Pi * 0.5f;
+            static constexpr float AxisX[4] = { 1, 0, -1, 0 };
+            static constexpr float AxisY[4] = { 0, 1, 0, -1 };
+            float k = Ceil(first / Quarter);
+            for (uint32_t i = 0; i < 4 && k * Quarter <= last; ++i, k += 1)
+            {
+                int32_t axis = int32_t(k) & 3; // two's complement: the right quadrant for negative k too
+                include(center.X + radius * AxisX[axis], center.Y + radius * AxisY[axis]);
+            }
+        }
+        float pad = half + ApplyGlow(*s, style.Glow) + 1 / ui.Scale;
+        SetBounds(*s, lo[0], lo[1], hi[0], hi[1], pad);
     }
 
     void Ui::DrawLine(Vec2 from, Vec2 to, const LineStyle& style)
@@ -322,53 +380,79 @@ namespace Funky
         UiImpl& ui = *Impl(this);
         if (text.empty() || style.Foreground.IsNone())
             return;
-        const TextLayout* layout = ui.Text.Layout(text, style, ui.Scale, ui.Frame);
-        const uint32_t count = layout->GlyphCount;
-        if (count == 0)
-            return;
-
-        // Glyph quads are pixel-snapped relative to the origin, so the origin is snapped too.
-        Vec2 origin = { Round(position.X * ui.Scale) / ui.Scale, Round(position.Y * ui.Scale) / ui.Scale };
-        // The union of the quads (computed like their rects below): BuildFrame keeps shapes drawn later
-        // over this text above it.
-        Vec2 first = origin + Vec2{ layout->Glyphs[0].X, layout->Glyphs[0].Y };
-        ClipRect bounds = { first.X, first.Y, first.X, first.Y };
-        for (uint32_t i = 0; i < count; ++i)
+        // Simple text in one color goes straight into glyph instances; the rest is laid out, then drawn.
+        if (style.Foreground.Type != Brush::Kind::LinearGradient)
         {
-            const GlyphQuad& q = layout->Glyphs[i];
-            float x = origin.X + q.X;
-            float y = origin.Y + q.Y;
-            bounds = { Min(bounds.MinX, x), Min(bounds.MinY, y), Max(bounds.MaxX, x + q.Width), Max(bounds.MaxY, y + q.Height) };
+            GpuGlyph* glyphs = ui.ReserveGlyphs(uint32_t(text.size()));
+            if (!glyphs)
+                return;
+            Vec2 origin = { Round(position.X * ui.Scale) / ui.Scale, Round(position.Y * ui.Scale) / ui.Scale };
+            uint32_t count = 0;
+            ClipRect ink;
+            const TextLayout* shaped = ui.Text.LayoutInto(text, style, ui.Scale, ui.Frame,
+                                                          { glyphs, origin, PackColor(style.Foreground.From), ui.CurrentClip }, count, ink);
+            if (shaped)
+                ui.DrawLayout(position, *shaped, style);
+            else
+                ui.CommitGlyphs(count, ink);
+            return;
         }
-        GpuGlyph* glyphs = ui.EmitGlyphs(count, bounds);
+        ui.DrawLayout(position, ui.LayoutText(text, style), style);
+    }
+
+    void UiImpl::DrawLayout(Vec2 position, const TextLayout& layout, const TextStyle& style)
+    {
+        const uint32_t count = layout.GlyphCount;
+        const Brush& brush = style.Foreground;
+        if (count == 0 || brush.IsNone())
+            return;
+        GpuGlyph* glyphs = ReserveGlyphs(count);
         if (!glyphs)
             return;
 
-        // A glyph has one color: a gradient is sampled at each glyph's center, blended like the shape
-        // shader does (premultiplied, linear space).
-        const Brush& brush = style.Foreground;
-        Paint paint = MakePaint(brush, { origin.X, origin.Y, layout->Size.X, layout->Size.Y });
-        Vec2 from = { paint.Axis[0], paint.Axis[1] };
-        Vec2 axis = Vec2{ paint.Axis[2], paint.Axis[3] } - from;
-        float axisScale = 1 / Max(Dot(axis, axis), 1e-8f);
+        // Glyph quads are pixel-snapped relative to the origin, so the origin is snapped too (as in DrawString).
+        Vec2 origin = { Round(position.X * Scale) / Scale, Round(position.Y * Scale) / Scale };
+        Paint paint = MakePaint(brush, { origin.X, origin.Y, layout.Size.X, layout.Size.Y });
+        const GlyphQuad* quads = layout.Glyphs;
+        uint32_t clip = CurrentClip;
         for (uint32_t i = 0; i < count; ++i)
         {
-            const GlyphQuad& q = layout->Glyphs[i];
+            const GlyphQuad& q = quads[i];
             GpuGlyph& g = glyphs[i];
-            g.Rect[0] = origin.X + q.X;
-            g.Rect[1] = origin.Y + q.Y;
-            g.Rect[2] = g.Rect[0] + q.Width;
-            g.Rect[3] = g.Rect[1] + q.Height;
-            // Atlas texels are whole numbers (the atlas is at most 65535 texels wide).
-            g.Texel0 = uint32_t(q.U0 + 0.5f) | (uint32_t(q.V0 + 0.5f) << 16);
-            g.Texel1 = uint32_t(q.U1 + 0.5f) | (uint32_t(q.V1 + 0.5f) << 16);
+            g.Rect[0] = origin.X + q.Rect[0];
+            g.Rect[1] = origin.Y + q.Rect[1];
+            g.Rect[2] = origin.X + q.Rect[2];
+            g.Rect[3] = origin.Y + q.Rect[3];
+            g.Texel0 = q.Texel0;
+            g.Texel1 = q.Texel1;
             g.Color = paint.Fill0;
-            if (paint.Flags & FlagGradient)
-            {
-                Vec2 center = { (g.Rect[0] + g.Rect[2]) * 0.5f, (g.Rect[1] + g.Rect[3]) * 0.5f };
-                g.Color = PackColor(Lerp(brush.From, brush.To, Saturate(Dot(center - from, axis) * axisScale)));
-            }
-            g.Clip = ui.CurrentClip;
+            g.Clip = clip;
         }
+
+        if (paint.Flags & FlagGradient)
+        {
+            // A glyph has one color: the gradient at its center, blended like the shape shader does
+            // (premultiplied, linear space). The ends are converted once.
+            float from[4], to[4];
+            ToPremultipliedLinear(brush.From, from);
+            ToPremultipliedLinear(brush.To, to);
+            Vec2 start = { paint.Axis[0], paint.Axis[1] };
+            Vec2 axis = Vec2{ paint.Axis[2], paint.Axis[3] } - start;
+            float axisScale = 1 / Max(Dot(axis, axis), 1e-8f);
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                GpuGlyph& g = glyphs[i];
+                Vec2 center = { (g.Rect[0] + g.Rect[2]) * 0.5f, (g.Rect[1] + g.Rect[3]) * 0.5f };
+                float t = Saturate(Dot(center - start, axis) * axisScale);
+                float mixed[4];
+                for (int k = 0; k < 4; ++k)
+                    mixed[k] = Lerp(from[k], to[k], t);
+                g.Color = PackColor(FromPremultipliedLinear(mixed));
+            }
+        }
+
+        // BuildFrame keeps shapes drawn later over this text above it.
+        const ClipRect& ink = layout.Ink;
+        CommitGlyphs(count, { origin.X + ink.MinX, origin.Y + ink.MinY, origin.X + ink.MaxX, origin.Y + ink.MaxY });
     }
 }
