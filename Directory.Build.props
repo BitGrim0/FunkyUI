@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Toolchain for the ClangCl toolset: llvm-msvc instead of the LLVM bundled with Visual Studio.
+     Applies to every project in this repository, also when it is built through a ProjectReference
+     from another solution. Skipped if the caller already sets LLVMInstallDir or the folder is missing. -->
+<Project>
+  <PropertyGroup Condition="'$(LLVMInstallDir)' == '' and Exists('C:\git\llvm-msvc-ex\install-release-64')">
+    <LLVMInstallDir>C:\git\llvm-msvc-ex\install-release-64</LLVMInstallDir>
+    <LLVMToolsVersion>777</LLVMToolsVersion>
+    <!-- MSVC STL matching llvm-msvc (same pin as the other projects). -->
+    <VCToolsVersion Condition="'$(VCToolsVersion)' == ''">14.44.35207</VCToolsVersion>
+  </PropertyGroup>
+</Project>
