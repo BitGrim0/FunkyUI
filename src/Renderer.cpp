@@ -1,5 +1,6 @@
 // D3D11 + DirectComposition renderer: every shape is one instanced quad whose signed distance
 // function is evaluated in Shaders/Shape.hlsl. No input layout, no vertex buffer.
+// Embedded mode draws with the client's device into the client's render target instead.
 
 #include "Internal.h"
 
@@ -95,10 +96,119 @@ namespace Funky
         };
 
         static_assert(sizeof(ShaderConstants) % 16 == 0);
+
+        // A shader stage's shader and its class instances (dynamic linkage), as the Get call returns them.
+        template <class T>
+        struct SavedShader
+        {
+            T* Shader;
+            ID3D11ClassInstance* Instances[D3D11_SHADER_MAX_INTERFACES];
+            UINT InstanceCount;
+
+            void Release()
+            {
+                SafeRelease(Shader);
+                for (UINT i = 0; i < InstanceCount; ++i)
+                    SafeRelease(Instances[i]);
+            }
+        };
+
+        // The client's device context state that an embedded Render changes, like imgui_impl_dx11.cpp saves it.
+        // Left alone, so not saved: vertex / index buffers (no input layout), scissor rects (scissor test off)
+        // and the depth-stencil state (no depth-stencil view is bound while drawing, so the tests are off).
+        struct ContextState
+        {
+            ID3D11RenderTargetView* Targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+            ID3D11DepthStencilView* DepthStencil;
+            ID3D11BlendState* Blend;
+            float BlendFactor[4];
+            UINT SampleMask;
+            ID3D11RasterizerState* Rasterizer;
+            D3D11_VIEWPORT Viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+            UINT ViewportCount;
+            ID3D11InputLayout* InputLayout;
+            D3D11_PRIMITIVE_TOPOLOGY Topology;
+            SavedShader<ID3D11VertexShader> VS;
+            SavedShader<ID3D11PixelShader> PS;
+            SavedShader<ID3D11GeometryShader> GS; // the other stages are unbound while drawing
+            SavedShader<ID3D11HullShader> HS;
+            SavedShader<ID3D11DomainShader> DS;
+            ID3D11ShaderResourceView* VSView;
+            ID3D11ShaderResourceView* PSViews[4];
+            ID3D11SamplerState* PSSampler;
+            ID3D11Buffer* VSConstants;
+            ID3D11Buffer* PSConstants;
+
+            void Save(ID3D11DeviceContext* c)
+            {
+                c->OMGetRenderTargets(ARRAYSIZE(Targets), Targets, &DepthStencil);
+                c->OMGetBlendState(&Blend, BlendFactor, &SampleMask);
+                c->RSGetState(&Rasterizer);
+                ViewportCount = ARRAYSIZE(Viewports);
+                c->RSGetViewports(&ViewportCount, Viewports);
+                c->IAGetInputLayout(&InputLayout);
+                c->IAGetPrimitiveTopology(&Topology);
+                VS.InstanceCount = PS.InstanceCount = GS.InstanceCount = HS.InstanceCount = DS.InstanceCount = D3D11_SHADER_MAX_INTERFACES;
+                c->VSGetShader(&VS.Shader, VS.Instances, &VS.InstanceCount);
+                c->PSGetShader(&PS.Shader, PS.Instances, &PS.InstanceCount);
+                c->GSGetShader(&GS.Shader, GS.Instances, &GS.InstanceCount);
+                c->HSGetShader(&HS.Shader, HS.Instances, &HS.InstanceCount);
+                c->DSGetShader(&DS.Shader, DS.Instances, &DS.InstanceCount);
+                c->VSGetShaderResources(0, 1, &VSView);
+                c->PSGetShaderResources(0, ARRAYSIZE(PSViews), PSViews);
+                c->PSGetSamplers(0, 1, &PSSampler);
+                c->VSGetConstantBuffers(0, 1, &VSConstants);
+                c->PSGetConstantBuffers(0, 1, &PSConstants);
+            }
+
+            // Render targets first: a shader view of a resource still bound as a target would be unbound again.
+            void Restore(ID3D11DeviceContext* c)
+            {
+                // Only up to the last bound target: UAVs in the slots after it stay as they are.
+                UINT targetCount = ARRAYSIZE(Targets);
+                while (targetCount > 0 && !Targets[targetCount - 1])
+                    --targetCount;
+                c->OMSetRenderTargets(targetCount, Targets, DepthStencil);
+                c->OMSetBlendState(Blend, BlendFactor, SampleMask);
+                c->RSSetState(Rasterizer);
+                c->RSSetViewports(ViewportCount, Viewports);
+                c->IASetInputLayout(InputLayout);
+                c->IASetPrimitiveTopology(Topology);
+                c->VSSetShader(VS.Shader, VS.Instances, VS.InstanceCount);
+                c->PSSetShader(PS.Shader, PS.Instances, PS.InstanceCount);
+                c->GSSetShader(GS.Shader, GS.Instances, GS.InstanceCount);
+                c->HSSetShader(HS.Shader, HS.Instances, HS.InstanceCount);
+                c->DSSetShader(DS.Shader, DS.Instances, DS.InstanceCount);
+                c->VSSetShaderResources(0, 1, &VSView);
+                c->PSSetShaderResources(0, ARRAYSIZE(PSViews), PSViews);
+                c->PSSetSamplers(0, 1, &PSSampler);
+                c->VSSetConstantBuffers(0, 1, &VSConstants);
+                c->PSSetConstantBuffers(0, 1, &PSConstants);
+
+                for (ID3D11RenderTargetView*& target : Targets)
+                    SafeRelease(target);
+                SafeRelease(DepthStencil);
+                SafeRelease(Blend);
+                SafeRelease(Rasterizer);
+                SafeRelease(InputLayout);
+                VS.Release();
+                PS.Release();
+                GS.Release();
+                HS.Release();
+                DS.Release();
+                SafeRelease(VSView);
+                for (ID3D11ShaderResourceView*& view : PSViews)
+                    SafeRelease(view);
+                SafeRelease(PSSampler);
+                SafeRelease(VSConstants);
+                SafeRelease(PSConstants);
+            }
+        };
     }
 
     struct Renderer::Impl
     {
+        bool Embedded;      // the client's device: no swap chain, no device recovery, its context state is restored
         HWND Window;
         ID3D11Device* Device;
         ID3D11DeviceContext* Context;
@@ -108,6 +218,8 @@ namespace Funky
         IDCompositionDevice* Composition;
         IDCompositionTarget* Target;
         IDCompositionVisual* Visual;
+        ID3D11RenderTargetView* ClientTarget; // embedded: the view the next Render draws into
+        ContextState Saved;                   // embedded: the client's state during Render (too big for the stack)
 
         ID3D11VertexShader* VertexShader;
         ID3D11PixelShader* PixelShader;
@@ -127,21 +239,22 @@ namespace Funky
         uint32_t Height;
         uint32_t RestoreDelay; // frames until the next attempt to recreate a lost device
 
-        // Until the first glyph arrives, t2 samples a 1x1 empty atlas.
+        // Embedded: the device is already set. Until the first glyph arrives, t2 samples a 1x1 empty atlas.
         bool CreateAll()
         {
             const uint8_t emptyTexel[2] = {};
-            return CreateDevice() && CreateSwapChain() && CreatePipeline() && CreateAtlas(1, emptyTexel);
+            return (Embedded || (CreateDevice() && CreateSwapChain())) && CreatePipeline() && CreateAtlas(1, emptyTexel);
         }
 
         // Leaves every object null, ready for CreateAll again.
         void ReleaseAll()
         {
-            if (Context)
+            if (Context && !Embedded) // the client's context keeps its state
             {
                 Context->ClearState();
                 Context->Flush(); // deferred destruction: the old swap chain and targets go away now
             }
+            SafeRelease(ClientTarget);
             SafeRelease(Visual);
             SafeRelease(Target);
             SafeRelease(Composition);
@@ -335,6 +448,38 @@ namespace Funky
             Context->PSSetSamplers(0, 1, &Sampler);
             Context->PSSetConstantBuffers(0, 1, &Constants);
         }
+
+        // Uploads the frame and draws it into the bound render target.
+        bool Draw(const GpuShape* shapes, uint32_t shapeCount,
+                  const DrawBatch* batches, uint32_t batchCount,
+                  const ClipRect* clips, uint32_t clipCount,
+                  const Vec2* points, uint32_t pointCount, float dpiScale)
+        {
+            if (shapeCount == 0)
+                return true;
+            if (!Shapes.Upload(Device, Context, shapes, shapeCount, sizeof(GpuShape)) ||
+                !Clips.Upload(Device, Context, clips, clipCount, sizeof(ClipRect)) ||
+                (pointCount > 0 && !Points.Upload(Device, Context, points, pointCount, sizeof(Vec2))))
+                return false;
+            BindPipeline();
+
+            ShaderConstants constants = {};
+            constants.ViewportSize[0] = float(Width) / dpiScale;
+            constants.ViewportSize[1] = float(Height) / dpiScale;
+            constants.DpiScale = dpiScale;
+            constants.AtlasTexelSize[0] = 1.0f / float(Max(AtlasSize, 1u));
+            constants.AtlasTexelSize[1] = constants.AtlasTexelSize[0];
+
+            // Every batch samples the glyph atlas: DrawBatch::Texture only matters once images exist (stage 3).
+            for (uint32_t i = 0; i < batchCount; ++i)
+            {
+                constants.FirstShape = batches[i].FirstShape;
+                if (!SetConstants(constants))
+                    return false;
+                Context->DrawInstanced(4, batches[i].ShapeCount, 0, 0);
+            }
+            return true;
+        }
     };
 
     bool Renderer::Init(HWND__* window, uint32_t width, uint32_t height)
@@ -346,6 +491,23 @@ namespace Funky
         State->Window = window;
         State->Width = Max(width, 1u);
         State->Height = Max(height, 1u);
+        if (State->CreateAll())
+            return true;
+        Shutdown();
+        return false;
+    }
+
+    bool Renderer::Init(ID3D11Device* device)
+    {
+        void* memory = MemAlloc(sizeof(Impl));
+        if (!memory)
+            return false;
+        State = new (memory) Impl();
+        State->Embedded = true;
+        State->Device = device;
+        device->AddRef();
+        device->GetImmediateContext(&State->Context);
+        State->Width = State->Height = 1;
         if (State->CreateAll())
             return true;
         Shutdown();
@@ -365,6 +527,8 @@ namespace Funky
     bool Renderer::RestoreDevice()
     {
         Impl& s = *State;
+        if (s.Embedded) // a lost client device is the client's to recreate (with a new Ui)
+            return false;
         if (s.Device && s.Device->GetDeviceRemovedReason() == S_OK)
             return false;
         // While the GPU stays unavailable (e.g. during a driver install), retry only now and then.
@@ -401,6 +565,17 @@ namespace Funky
         s.CreateBackBufferView(); // on failure Render retries and reports it
     }
 
+    void Renderer::SetTarget(ID3D11RenderTargetView* view, uint32_t width, uint32_t height)
+    {
+        Impl& s = *State;
+        if (view)
+            view->AddRef();
+        SafeRelease(s.ClientTarget);
+        s.ClientTarget = view;
+        s.Width = Max(width, 1u);
+        s.Height = Max(height, 1u);
+    }
+
     void Renderer::UpdateAtlas(const AtlasUpdate& update)
     {
         Impl& s = *State;
@@ -425,6 +600,24 @@ namespace Funky
                           const Vec2* points, uint32_t pointCount, float dpiScale)
     {
         Impl& s = *State;
+        if (s.Embedded)
+        {
+            // On top of the client's target, then the client's context state is given back as it was.
+            bool ok = s.ClientTarget != nullptr;
+            if (ok && shapeCount > 0)
+            {
+                s.Saved.Save(s.Context);
+                s.Context->OMSetRenderTargets(1, &s.ClientTarget, nullptr);
+                s.Context->GSSetShader(nullptr, nullptr, 0);
+                s.Context->HSSetShader(nullptr, nullptr, 0);
+                s.Context->DSSetShader(nullptr, nullptr, 0);
+                ok = s.Draw(shapes, shapeCount, batches, batchCount, clips, clipCount, points, pointCount, dpiScale);
+                s.Saved.Restore(s.Context);
+            }
+            SafeRelease(s.ClientTarget); // see SetTarget
+            return ok;
+        }
+
         if (!s.Device || (!s.BackBuffer && !s.CreateBackBufferView()))
             return false;
 
@@ -432,32 +625,8 @@ namespace Funky
         const float transparent[4] = {};
         s.Context->OMSetRenderTargets(1, &s.BackBuffer, nullptr);
         s.Context->ClearRenderTargetView(s.BackBuffer, transparent);
-
-        if (shapeCount > 0)
-        {
-            if (!s.Shapes.Upload(s.Device, s.Context, shapes, shapeCount, sizeof(GpuShape)) ||
-                !s.Clips.Upload(s.Device, s.Context, clips, clipCount, sizeof(ClipRect)) ||
-                (pointCount > 0 && !s.Points.Upload(s.Device, s.Context, points, pointCount, sizeof(Vec2))))
-                return false;
-            s.BindPipeline();
-
-            ShaderConstants constants = {};
-            constants.ViewportSize[0] = float(s.Width) / dpiScale;
-            constants.ViewportSize[1] = float(s.Height) / dpiScale;
-            constants.DpiScale = dpiScale;
-            constants.AtlasTexelSize[0] = 1.0f / float(Max(s.AtlasSize, 1u));
-            constants.AtlasTexelSize[1] = constants.AtlasTexelSize[0];
-
-            // Every batch samples the glyph atlas: DrawBatch::Texture only matters once images exist (stage 3).
-            for (uint32_t i = 0; i < batchCount; ++i)
-            {
-                constants.FirstShape = batches[i].FirstShape;
-                if (!s.SetConstants(constants))
-                    return false;
-                s.Context->DrawInstanced(4, batches[i].ShapeCount, 0, 0);
-            }
-        }
-        return SUCCEEDED(s.SwapChain->Present(1, 0));
+        return s.Draw(shapes, shapeCount, batches, batchCount, clips, clipCount, points, pointCount, dpiScale) &&
+               SUCCEEDED(s.SwapChain->Present(1, 0));
     }
 
     void* Renderer::FrameWaitable() const

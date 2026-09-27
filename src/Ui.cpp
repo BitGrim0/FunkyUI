@@ -134,13 +134,16 @@ namespace Funky
 
         void ReadInput(UiImpl& ui)
         {
-            const InputEvents& input = ui.Window.Input();
+            const InputEvents& input = ui.Embedded ? ui.EmbeddedInput : ui.Window.Input();
             ui.PreviousPointer = ui.Pointer;
             ui.Pointer = input.PointerPx / ui.Scale;
             ui.ButtonDown = ui.Interactive && input.ButtonDown[0];
             ui.ButtonPressed = ui.Interactive && input.Pressed[0] > 0;
             ui.ButtonReleased = ui.Interactive && input.Released[0] > 0;
-            ui.Window.ClearInputEdges();
+            if (ui.Embedded)
+                ui.EmbeddedInput.Pressed[0] = ui.EmbeddedInput.Released[0] = 0;
+            else
+                ui.Window.ClearInputEdges();
 
             if (!ui.Interactive)
             {
@@ -179,19 +182,24 @@ namespace Funky
             }
         }
 
-        // Presents the frame unless it is identical to the last presented one.
+        // Presents the frame unless it is identical to the last presented one. An embedded target is
+        // redrawn by the client every frame, so it always gets the UI.
         void Present(UiImpl& ui)
         {
-            float view[3] = { ui.Viewport.X, ui.Viewport.Y, ui.Scale };
-            uint64_t hash = HashMemory(ui.FinalShapes.Data, sizeof(GpuShape) * ui.FinalShapes.Count);
-            hash = HashMemory(ui.Clips.Data, sizeof(ClipRect) * ui.Clips.Count, hash);
-            hash = HashMemory(ui.Points.Data, sizeof(Vec2) * ui.Points.Count, hash);
-            hash = HashMemory(ui.Batches.Data, sizeof(DrawBatch) * ui.Batches.Count, hash);
-            hash = HashMemory(view, sizeof(view), hash);
+            uint64_t hash = 0;
+            if (!ui.Embedded)
+            {
+                float view[3] = { ui.Viewport.X, ui.Viewport.Y, ui.Scale };
+                hash = HashMemory(ui.FinalShapes.Data, sizeof(GpuShape) * ui.FinalShapes.Count);
+                hash = HashMemory(ui.Clips.Data, sizeof(ClipRect) * ui.Clips.Count, hash);
+                hash = HashMemory(ui.Points.Data, sizeof(Vec2) * ui.Points.Count, hash);
+                hash = HashMemory(ui.Batches.Data, sizeof(DrawBatch) * ui.Batches.Count, hash);
+                hash = HashMemory(view, sizeof(view), hash);
 
-            ui.PresentedLastFrame = false;
-            if (!ui.Window.IsVisible() || (hash == ui.LastFrameHash && !ui.ForceRedraw))
-                return;
+                ui.PresentedLastFrame = false;
+                if (!ui.Window.IsVisible() || (hash == ui.LastFrameHash && !ui.ForceRedraw))
+                    return;
+            }
             ui.PresentedLastFrame = ui.Gpu.Render(ui.FinalShapes.Data, ui.FinalShapes.Count, ui.Batches.Data, ui.Batches.Count,
                                                   ui.Clips.Data, ui.Clips.Count, ui.Points.Data, ui.Points.Count, ui.Scale);
             if (ui.PresentedLastFrame)
@@ -217,26 +225,30 @@ namespace Funky
                     ui.PanelOrder.RemoveAt(i);
             }
         }
+
+        template <class Desc>
+        Ui* CreateUi(const Desc& desc)
+        {
+            SetAllocator(desc.Allocator);
+            void* memory = MemAlloc(sizeof(UiImpl));
+            if (!memory)
+                return nullptr;
+            UiImpl* ui = new (memory) UiImpl();
+            if (!ui->Init(desc))
+            {
+                ui->Destroy();
+                return nullptr;
+            }
+            return ui;
+        }
     }
 
     // ------------------------------------------------------------------------------------
     // Lifetime
     // ------------------------------------------------------------------------------------
 
-    Ui* Ui::Create(const OverlayDesc& desc)
-    {
-        SetAllocator(desc.Allocator);
-        void* memory = MemAlloc(sizeof(UiImpl));
-        if (!memory)
-            return nullptr;
-        UiImpl* ui = new (memory) UiImpl();
-        if (!ui->Init(desc))
-        {
-            ui->Destroy();
-            return nullptr;
-        }
-        return ui;
-    }
+    Ui* Ui::Create(const OverlayDesc& desc) { return CreateUi(desc); }
+    Ui* Ui::CreateEmbedded(const EmbeddedDesc& desc) { return CreateUi(desc); }
 
     void Ui::Destroy()
     {
@@ -248,24 +260,30 @@ namespace Funky
 
     bool UiImpl::Init(const OverlayDesc& desc)
     {
-        bool ok = Window.Init(static_cast<HWND__*>(desc.TargetWindow), desc.WindowClassName, Scratch);
-        if (ok)
-        {
-            SurfaceWidth = Max(Window.Width(), 1u);
-            SurfaceHeight = Max(Window.Height(), 1u);
-            // The first push of every frame then never allocates (see BeginFrame).
-            ok = Gpu.Init(Window.Window(), SurfaceWidth, SurfaceHeight) && Text.Init(desc.DefaultFontFamily, Scratch) &&
-                 OpenContainers.Reserve(16) && Clips.Reserve(16);
-        }
-        Scratch.Reset();
-        if (!ok)
+        if (!Window.Init(static_cast<HWND__*>(desc.TargetWindow), desc.WindowClassName, Scratch))
             return false;
-
+        SurfaceWidth = Max(Window.Width(), 1u);
+        SurfaceHeight = Max(Window.Height(), 1u);
         Scale = Window.DpiScale();
+        return Gpu.Init(Window.Window(), SurfaceWidth, SurfaceHeight) && InitCommon(desc.DefaultFontFamily);
+    }
+
+    // The size and scale come with SetRenderTarget.
+    bool UiImpl::Init(const EmbeddedDesc& desc)
+    {
+        Embedded = true;
+        return desc.Device && Gpu.Init(static_cast<ID3D11Device*>(desc.Device)) && InitCommon(desc.DefaultFontFamily);
+    }
+
+    bool UiImpl::InitCommon(std::string_view defaultFontFamily)
+    {
+        // The first push of every frame then never allocates (see BeginFrame).
+        bool ok = Text.Init(defaultFontFamily, Scratch) && OpenContainers.Reserve(16) && Clips.Reserve(16);
+        Scratch.Reset();
         Viewport = { float(SurfaceWidth) / Scale, float(SurfaceHeight) / Scale };
         QueryPerformanceFrequency(reinterpret_cast<_LARGE_INTEGER*>(&TickFrequency));
         LastTicks = Ticks();
-        return true;
+        return ok;
     }
 
     void UiImpl::Shutdown()
@@ -295,26 +313,30 @@ namespace Funky
     bool Ui::BeginFrame()
     {
         UiImpl& ui = *Impl(this);
-        ui.Window.WaitForFrame(ui.Gpu.FrameWaitable(), ui.PresentedLastFrame);
-        if (!ui.Window.Update())
-            return false;
+        // Embedded: the client paces the frames and gives the size and scale with SetRenderTarget.
+        if (!ui.Embedded)
+        {
+            ui.Window.WaitForFrame(ui.Gpu.FrameWaitable(), ui.PresentedLastFrame);
+            if (!ui.Window.Update())
+                return false;
+
+            uint32_t width = Max(ui.Window.Width(), 1u);
+            uint32_t height = Max(ui.Window.Height(), 1u);
+            if (width != ui.SurfaceWidth || height != ui.SurfaceHeight)
+            {
+                ui.Gpu.Resize(width, height);
+                ui.SurfaceWidth = width;
+                ui.SurfaceHeight = height;
+                ui.ForceRedraw = true;
+            }
+            ui.Scale = ui.Window.DpiScale();
+        }
 
         ++ui.FrameIndex;
         int64_t now = Ticks();
         ui.Dt = Clamp(float(double(now - ui.LastTicks) / double(ui.TickFrequency)), 0.0f, MaxDeltaTime);
         ui.LastTicks = now;
-
-        uint32_t width = Max(ui.Window.Width(), 1u);
-        uint32_t height = Max(ui.Window.Height(), 1u);
-        if (width != ui.SurfaceWidth || height != ui.SurfaceHeight)
-        {
-            ui.Gpu.Resize(width, height);
-            ui.SurfaceWidth = width;
-            ui.SurfaceHeight = height;
-            ui.ForceRedraw = true;
-        }
-        ui.Scale = ui.Window.DpiScale();
-        ui.Viewport = { float(width) / ui.Scale, float(height) / ui.Scale };
+        ui.Viewport = { float(ui.SurfaceWidth) / ui.Scale, float(ui.SurfaceHeight) / ui.Scale };
 
         ReadInput(ui);
 
@@ -350,8 +372,11 @@ namespace Funky
             ui.ActiveIsPanelDrag = false;
         }
         ui.PointerOverUi = ui.Interactive && (ui.ActiveId != 0 || ui.WidgetHoveredThisFrame || PanelAt(ui, ui.Pointer, ui.FrameIndex) != 0);
-        ui.Window.SetClickThrough(!ui.PointerOverUi);
-        ui.Window.SetPointerCapture(ui.ActiveId != 0);
+        if (!ui.Embedded) // embedded: the client routes the input by IsPointerOver()
+        {
+            ui.Window.SetClickThrough(!ui.PointerOverUi);
+            ui.Window.SetPointerCapture(ui.ActiveId != 0);
+        }
 
         ui.BuildFrame();
         // A recreated device starts without the atlas.
@@ -389,6 +414,27 @@ namespace Funky
     // ------------------------------------------------------------------------------------
     // Input & frame info
     // ------------------------------------------------------------------------------------
+
+    void Ui::SetRenderTarget(void* renderTargetView, uint32_t widthPx, uint32_t heightPx, float dpiScale)
+    {
+        UiImpl& ui = *Impl(this);
+        if (!ui.Embedded)
+            return;
+        ui.SurfaceWidth = Max(widthPx, 1u);
+        ui.SurfaceHeight = Max(heightPx, 1u);
+        ui.Scale = dpiScale > 0 ? dpiScale : 1;
+        ui.Gpu.SetTarget(static_cast<ID3D11RenderTargetView*>(renderTargetView), ui.SurfaceWidth, ui.SurfaceHeight);
+    }
+
+    // Edges are counted here: a client that calls it for every mouse event also keeps clicks shorter than a frame.
+    void Ui::SetPointer(Vec2 positionPx, bool leftButtonDown)
+    {
+        InputEvents& input = Impl(this)->EmbeddedInput;
+        input.PointerPx = positionPx;
+        if (leftButtonDown != input.ButtonDown[0])
+            ++(leftButtonDown ? input.Pressed[0] : input.Released[0]);
+        input.ButtonDown[0] = leftButtonDown;
+    }
 
     void Ui::SetInteractive(bool interactive) { Impl(this)->Interactive = interactive; }
     bool Ui::IsInteractive() const { return Impl(this)->Interactive; }

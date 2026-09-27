@@ -7,6 +7,8 @@
 #include "Base.h"
 
 struct HWND__;
+struct ID3D11Device;
+struct ID3D11RenderTargetView;
 
 namespace Funky
 {
@@ -119,7 +121,8 @@ namespace Funky
     };
 
     // ====================================================================================
-    // Renderer — D3D11 + DirectComposition (Renderer.cpp, Shaders/Shape.hlsl)
+    // Renderer — D3D11 + DirectComposition (Renderer.cpp, Shaders/Shape.hlsl).
+    // Embedded mode: the client's device, no swap chain; draws into the view given by SetTarget.
     // ====================================================================================
 
     struct AtlasUpdate
@@ -133,16 +136,22 @@ namespace Funky
     class Renderer
     {
     public:
-        bool Init(HWND__* window, uint32_t width, uint32_t height); // physical pixels
+        bool Init(HWND__* window, uint32_t width, uint32_t height); // overlay: own device and swap chain, physical pixels
+        bool Init(ID3D11Device* device);                           // embedded: the client's device (referenced)
         void Shutdown();
-        void Resize(uint32_t width, uint32_t height);
+        void Resize(uint32_t width, uint32_t height);              // overlay
         void UpdateAtlas(const AtlasUpdate& update);
 
-        // After a device loss (driver update, GPU reset or switch) recreates the device and swap chain,
-        // retrying at most every few frames. Returns true when it did: the atlas must be uploaded again.
+        // Embedded: the view the next Render draws into and its size in physical pixels. The view is
+        // referenced only until that Render, so the client can resize its swap chain between frames.
+        void SetTarget(ID3D11RenderTargetView* view, uint32_t width, uint32_t height);
+
+        // Overlay: after a device loss (driver update, GPU reset or switch) recreates the device and swap
+        // chain, retrying at most every few frames. Returns true when it did: the atlas must be uploaded again.
         bool RestoreDevice();
 
-        // Clears to transparent, draws the batches and presents. Shapes and points are in DIPs.
+        // Overlay: clears to transparent, draws the batches and presents. Embedded: draws on top of the
+        // target and restores the device context state it changed. Shapes and points are in DIPs.
         // clips[0] must be the "no clipping" rect.
         bool Render(const GpuShape* shapes, uint32_t shapeCount,
                     const DrawBatch* batches, uint32_t batchCount,
@@ -319,6 +328,7 @@ namespace Funky
 
     struct UiImpl : Ui
     {
+        bool Embedded = false;              // CreateEmbedded: no Host, the client's device and render target
         Host Window;
         Renderer Gpu;
         TextSystem Text;
@@ -339,6 +349,7 @@ namespace Funky
         bool ForceRedraw = true;
 
         // Input (DIPs)
+        InputEvents EmbeddedInput = {};     // embedded mode: fed by SetPointer (physical pixels, left button only)
         bool Interactive = false;
         Vec2 Pointer;
         Vec2 PreviousPointer;
@@ -370,6 +381,8 @@ namespace Funky
 
         // --- Ui.cpp ----------------------------------------------------------------------
         bool Init(const OverlayDesc& desc);
+        bool Init(const EmbeddedDesc& desc);
+        bool InitCommon(std::string_view defaultFontFamily); // after the renderer: text, reserves, clock
         void Shutdown();
         Container& Top() { return OpenContainers.Back(); }
         uint64_t MakeId(Key key);           // HashCombine(parent id, key) or positional when key is none

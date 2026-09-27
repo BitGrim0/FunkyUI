@@ -12,7 +12,7 @@ src/
   Base.h / Base.cpp             память, Array, HashMap, Arena, хэши, математика, UTF-8 → UTF-16
   Internal.h                    интерфейсы модулей, GpuShape, UiImpl
   Host.cpp                      окно-оверлей: слежение за целью, ввод, click-through, пейсинг кадров
-  Renderer.cpp                  D3D11 + DirectComposition: swapchain, буферы, атлас, отрисовка
+  Renderer.cpp                  D3D11 + DirectComposition: swapchain, буферы, атлас, отрисовка; embedded — устройство и цель клиента
   Shaders/Shape.hlsl            один VS + один PS для всех фигур (SDF)
   Text.cpp                      DirectWrite: шрифты, раскладка, растеризация глифов в атлас, кэши
   Ui.cpp                        UiImpl: жизненный цикл, кадр, ID, ввод, панели, Transition, сборка кадра
@@ -42,6 +42,8 @@ EndFrame
   GC: панели, состояния контейнеров и Transition, не встречавшиеся N кадров, удаляются
   Text.EndFrame            вытеснение раскладок/форматов; сброс заполненного атласа — только здесь
 ```
+
+В режиме встраивания шагов Host, RestoreDevice и сравнения хэша нет — см. «Режим встраивания (embedded)».
 
 ## Координаты и DPI
 
@@ -122,7 +124,7 @@ Immediate-mode с памятью прошлого кадра, как догов�
 - Swapchain: `CreateSwapChainForComposition`, FLIP_SEQUENTIAL, B8G8R8A8_UNORM, premultiplied,
   2 буфера, `FRAME_LATENCY_WAITABLE_OBJECT`, `SetMaximumFrameLatency(1)`. Начальный сигнал waitable
   забирается сразу при создании, поэтому каждое ожидание в `WaitForFrame` парно одному Present.
-- Потеря устройства (обновление драйвера, TDR, смена GPU): `RestoreDevice` в каждом EndFrame
+- Потеря устройства (обновление драйвера, TDR, смена GPU), только оверлей: `RestoreDevice` в каждом EndFrame
   проверяет `GetDeviceRemovedReason`, пересоздаёт всё (не чаще раза в 60 кадров при неудаче), и Ui
   просит у Text полную перезаливку атласа.
 - Шейдеры собираются `FxCompile` (SM 5.0) в заголовки с байт-кодом, `/Qstrip_reflect /Qstrip_debug`.
@@ -169,11 +171,31 @@ Immediate-mode с памятью прошлого кадра, как догов�
 
 ## Режим встраивания (embedded)
 
-`Ui::CreateEmbedded` создаёт UI без окна и swapchain'а на устройстве D3D11 клиента. Клиент каждый кадр
-вызывает `SetRenderTarget(rtv, w, h, scale)` и (для ввода) `SetPointer(pos, down)`, затем
-`BeginFrame`/`EndFrame`. `EndFrame` рисует поверх содержимого цели без очистки и Present, сохраняя и
-восстанавливая состояние контекста, которое меняет (IA, VS, PS, RS, OM, viewport, SRV, sampler, CB),
-как это делает бэкенд ImGui. Пропуска кадров нет: цель клиента перерисовывается каждый кадр.
-Host не создаётся; интерактивный режим управляется клиентом так же через `SetInteractive`.
-Этот режим используется бенчмарком Throughput (рендер в offscreen-текстуру без Present) и будет
-основой встраивания в чужой swapchain.
+`Ui::CreateEmbedded` создаёт UI без окна и swapchain'а на устройстве D3D11 клиента: Host не создаётся, Renderer берёт
+ссылку на устройство (AddRef) и его immediate context и создаёт на нём только свои шейдеры, состояния, буферы и атлас.
+Клиент каждый кадр вызывает `SetRenderTarget(rtv, w, h, scale)` и (для ввода) `SetPointer(pos, down)`, затем
+`BeginFrame`/`EndFrame`. Остальной Renderer (загрузка буферов, атлас, отрисовка батчей) общий с оверлеем.
+
+- `SetRenderTarget` задаёт цель ближайшего `EndFrame`: размер в физических пикселях, viewport в DIPs = размер / scale.
+  Ссылка на RTV держится только до конца этого `EndFrame`: между кадрами библиотека не держит back buffer, и
+  `ResizeBuffers` клиента работает. RTV — UNORM (не `_SRGB`): вывод в sRGB с premultiplied alpha, как в оверлее.
+- `SetPointer` — курсор в физических пикселях цели и левая кнопка. Фронты считаются в самом вызове: при вызове раз
+  в кадр нажатие и отпускание внутри одного кадра теряются, при вызове на каждое событие мыши — нет. Интерактивный
+  режим — `SetInteractive`, как в оверлее; click-through и захвата мыши нет (нет окна), ввод клиент направляет сам
+  по `IsPointerOver()`.
+- `BeginFrame` не ждёт и не качает сообщения, dt — по `QueryPerformanceCounter`, всегда возвращает true.
+- `EndFrame` собирает кадр как обычно, заливает атлас, если нужно, и рисует поверх содержимого цели без очистки и
+  Present. Пропуска кадров нет: цель клиента перерисовывается каждый кадр. Пустой кадр контекст не трогает.
+- Состояние контекста, которое меняет отрисовка, сохраняется перед ней и восстанавливается после (как в
+  `imgui_impl_dx11.cpp`): render targets и DSV, blend state (+ blend factor, sample mask), rasterizer state, viewports,
+  input layout, topology, VS и PS (+ class instances) с их t0 / t0–t3, s0, b0. GS/HS/DS на время отрисовки снимаются
+  и потом возвращаются. Не меняются и поэтому не сохраняются: vertex/index buffers (input layout нет), scissor rects
+  (scissor test выключен), depth-stencil state (DSV на время отрисовки не привязан, тесты глубины и трафарета выключены).
+  Render targets восстанавливаются первыми (иначе D3D снял бы восстановленные SRV того же ресурса) и только до
+  последнего занятого слота (UAV в слотах после него остаются). Сохранённое состояние лежит в Renderer (class instances
+  не помещаются на стек).
+- Потерю устройства библиотека не обрабатывает — устройство принадлежит клиенту: он пересоздаёт устройство и UI
+  (`Destroy` + `CreateEmbedded`).
+
+Этот режим используется бенчмарком Throughput (рендер в offscreen-текстуру без Present) и будет основой встраивания
+в чужой swapchain.

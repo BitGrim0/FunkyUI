@@ -625,6 +625,7 @@ namespace Funky
         // --- Frame -------------------------------------------------------------------------
         // BeginFrame waits for the next frame slot, pumps window messages, follows the target
         // window and reads input. Returns false when the target window is gone.
+        // Embedded: no waiting and no message pump (the client paces the frames); always returns true.
         bool BeginFrame();
         void EndFrame();
 

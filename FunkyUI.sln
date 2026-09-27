@@ -7,6 +7,10 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FunkyUI", "FunkyUI.vcxproj"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Demo", "Examples\Demo\Demo.vcxproj", "{13A9AC65-FEE2-4B54-A222-D89F78654E3A}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "FunkyBench", "Benchmarks\FunkyBench\FunkyBench.vcxproj", "{6A81F450-2569-4BE1-BF86-977B2E5D113A}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ImGuiBench", "Benchmarks\ImGuiBench\ImGuiBench.vcxproj", "{58C4BE23-0CF2-482D-B262-5552AB6A6CE3}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -21,6 +25,14 @@ Global
 		{13A9AC65-FEE2-4B54-A222-D89F78654E3A}.Debug|x64.Build.0 = Debug|x64
 		{13A9AC65-FEE2-4B54-A222-D89F78654E3A}.Release|x64.ActiveCfg = Release|x64
 		{13A9AC65-FEE2-4B54-A222-D89F78654E3A}.Release|x64.Build.0 = Release|x64
+		{6A81F450-2569-4BE1-BF86-977B2E5D113A}.Debug|x64.ActiveCfg = Debug|x64
+		{6A81F450-2569-4BE1-BF86-977B2E5D113A}.Debug|x64.Build.0 = Debug|x64
+		{6A81F450-2569-4BE1-BF86-977B2E5D113A}.Release|x64.ActiveCfg = Release|x64
+		{6A81F450-2569-4BE1-BF86-977B2E5D113A}.Release|x64.Build.0 = Release|x64
+		{58C4BE23-0CF2-482D-B262-5552AB6A6CE3}.Debug|x64.ActiveCfg = Debug|x64
+		{58C4BE23-0CF2-482D-B262-5552AB6A6CE3}.Debug|x64.Build.0 = Debug|x64
+		{58C4BE23-0CF2-482D-B262-5552AB6A6CE3}.Release|x64.ActiveCfg = Release|x64
+		{58C4BE23-0CF2-482D-B262-5552AB6A6CE3}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
