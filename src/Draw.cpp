@@ -1,5 +1,6 @@
-// Draw — primitives → GpuShape instances (one screen-aligned quad per shape, SDF in the pixel shader).
-// Bounds cover everything the shader may draw: antialiasing (one physical pixel), glow, shadow blur.
+// Draw — primitives → GpuShape instances (one screen-aligned quad per shape, SDF in the pixel shader) and
+// text → GpuGlyph instances (one quad per glyph). Shape bounds cover everything the shader may draw:
+// antialiasing (one physical pixel), glow, shadow blur.
 
 #include "Internal.h"
 
@@ -90,9 +91,14 @@ namespace Funky
             return a.X * b.Y - a.Y * b.X;
         }
 
+        float Dot(Vec2 a, Vec2 b)
+        {
+            return a.X * b.X + a.Y * b.Y;
+        }
+
         float Length(Vec2 v)
         {
-            return Sqrt(v.X * v.X + v.Y * v.Y);
+            return Sqrt(Dot(v, v));
         }
 
         Rect BoundingBox(const Vec2* points, uint32_t count)
@@ -157,11 +163,13 @@ namespace Funky
                 return;
             uint32_t first = ui.Points.Count;
             Vec2* stored = ui.Points.Append(count);
+            if (!stored)
+                return;
+            MemCopy(stored, points, sizeof(Vec2) * count); // before EmitShapes, which hashes them (see FoldEmitted)
             uint32_t instances = (count - 2) / MaxPolylineSegments + 1;
-            GpuShape* shapes = stored ? ui.EmitShapes(instances) : nullptr;
+            GpuShape* shapes = ui.EmitShapes(instances);
             if (!shapes)
                 return;
-            MemCopy(stored, points, sizeof(Vec2) * count);
 
             Paint paint = MakePaint(style.Stroke, BoundingBox(points, count));
             float half = style.Thickness * 0.5f;
@@ -314,27 +322,53 @@ namespace Funky
         UiImpl& ui = *Impl(this);
         if (text.empty() || style.Foreground.IsNone())
             return;
-        const TextLayout* layout = ui.Text.Layout(text, style, ui.Scale, ui.FrameIndex, ui.Frame);
-        if (layout->GlyphCount == 0)
-            return;
-        GpuShape* shapes = ui.EmitShapes(layout->GlyphCount);
-        if (!shapes)
+        const TextLayout* layout = ui.Text.Layout(text, style, ui.Scale, ui.Frame);
+        const uint32_t count = layout->GlyphCount;
+        if (count == 0)
             return;
 
         // Glyph quads are pixel-snapped relative to the origin, so the origin is snapped too.
         Vec2 origin = { Round(position.X * ui.Scale) / ui.Scale, Round(position.Y * ui.Scale) / ui.Scale };
-        Paint paint = MakePaint(style.Foreground, { origin.X, origin.Y, layout->Size.X, layout->Size.Y });
-        for (uint32_t i = 0; i < layout->GlyphCount; ++i)
+        // The union of the quads (computed like their rects below): BuildFrame keeps shapes drawn later
+        // over this text above it.
+        Vec2 first = origin + Vec2{ layout->Glyphs[0].X, layout->Glyphs[0].Y };
+        ClipRect bounds = { first.X, first.Y, first.X, first.Y };
+        for (uint32_t i = 0; i < count; ++i)
         {
-            const GlyphQuad& g = layout->Glyphs[i];
-            GpuShape& s = shapes[i];
-            s.TypeFlags |= ShapeGlyph;
-            SetBounds(s, origin.X + g.X, origin.Y + g.Y, origin.X + g.X + g.Width, origin.Y + g.Y + g.Height, 0);
-            s.P0[0] = g.U0;
-            s.P0[1] = g.V0;
-            s.P0[2] = g.U1;
-            s.P0[3] = g.V1;
-            ApplyPaint(s, paint);
+            const GlyphQuad& q = layout->Glyphs[i];
+            float x = origin.X + q.X;
+            float y = origin.Y + q.Y;
+            bounds = { Min(bounds.MinX, x), Min(bounds.MinY, y), Max(bounds.MaxX, x + q.Width), Max(bounds.MaxY, y + q.Height) };
+        }
+        GpuGlyph* glyphs = ui.EmitGlyphs(count, bounds);
+        if (!glyphs)
+            return;
+
+        // A glyph has one color: a gradient is sampled at each glyph's center, blended like the shape
+        // shader does (premultiplied, linear space).
+        const Brush& brush = style.Foreground;
+        Paint paint = MakePaint(brush, { origin.X, origin.Y, layout->Size.X, layout->Size.Y });
+        Vec2 from = { paint.Axis[0], paint.Axis[1] };
+        Vec2 axis = Vec2{ paint.Axis[2], paint.Axis[3] } - from;
+        float axisScale = 1 / Max(Dot(axis, axis), 1e-8f);
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            const GlyphQuad& q = layout->Glyphs[i];
+            GpuGlyph& g = glyphs[i];
+            g.Rect[0] = origin.X + q.X;
+            g.Rect[1] = origin.Y + q.Y;
+            g.Rect[2] = g.Rect[0] + q.Width;
+            g.Rect[3] = g.Rect[1] + q.Height;
+            // Atlas texels are whole numbers (the atlas is at most 65535 texels wide).
+            g.Texel0 = uint32_t(q.U0 + 0.5f) | (uint32_t(q.V0 + 0.5f) << 16);
+            g.Texel1 = uint32_t(q.U1 + 0.5f) | (uint32_t(q.V1 + 0.5f) << 16);
+            g.Color = paint.Fill0;
+            if (paint.Flags & FlagGradient)
+            {
+                Vec2 center = { (g.Rect[0] + g.Rect[2]) * 0.5f, (g.Rect[1] + g.Rect[3]) * 0.5f };
+                g.Color = PackColor(Lerp(brush.From, brush.To, Saturate(Dot(center - from, axis) * axisScale)));
+            }
+            g.Clip = ui.CurrentClip;
         }
     }
 }

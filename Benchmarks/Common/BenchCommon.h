@@ -8,12 +8,14 @@
 //
 // One frame (Runner::RunFrame):
 //     generate the model                                  not measured
-//     [throughput] clear the target                      -+                                   -+
-//     Backend::BeginFrame   vsync wait, messages, begin   |  CPU cycles of this thread         |
-//     Backend::Build        UI code          = build ms   |  (blocking waits cost no cycles)   |  throughput:
-//     Backend::EndFrame     render (+present) = submit ms |                                    |  frame time
-//     [throughput] end query + flush                     -+                                    |
-//     [throughput] spin until the GPU is done             = GPU wait ms                       -+
+//     [throughput] wait for a free timestamp slot         = GPU wait ms (only when the ring is full)
+//     Backend::BeginFrame   vsync wait, messages, begin  -+
+//     Backend::Build        UI code          = build ms   |  CPU cycles of this thread
+//     [throughput] disjoint + begin timestamp + clear     |  (blocking waits cost no cycles)
+//     Backend::EndFrame     render (+present) = submit ms |  throughput: CPU frame ms (wall)
+//     [throughput] end timestamp + flush                 -+
+// Throughput never waits for the frame it just submitted: up to GpuFramesInFlight frames are in flight and
+// their GPU times (timestamp queries) are read a few frames later. Throughput FPS = 1000 / max(CPU, GPU).
 // Display measures frame to frame instead (generation included, normally hidden in the vsync wait).
 
 #pragma once
@@ -25,6 +27,7 @@
 #include <pdh.h>
 #include <pdhmsg.h>
 #include <psapi.h>
+#include <timeapi.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -47,6 +50,7 @@
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "winmm.lib")
 
 // printf-style format checking where the compiler supports it.
 #if defined(__clang__)
@@ -402,13 +406,20 @@ namespace Bench
     // Offscreen target (throughput mode): own device, no swap chain, no Present
     // ------------------------------------------------------------------------------------
 
-    struct OffscreenTarget
+    // Frames the CPU may run ahead of the GPU. Without Present a query's completion is only noticed at the next
+    // Windows timer tick (~15.6 ms, 1 ms under the throughput mode's timeBeginPeriod(1)): the ring must hold a
+    // whole tick of frames, or the GPU gets bursts, idles between them and drops its clocks. 64 cover a 1 ms tick
+    // at any frame cost, and a default tick from ~0.25 ms per frame. A slot is 3 small queries.
+    constexpr int GpuFramesInFlight = 64;   // the legend and the README name this number
+
+    // The target plus a ring of timestamp queries: each frame's GPU time is read a few frames later.
+    class OffscreenTarget
     {
+    public:
         ComPtr<ID3D11Device> Device;
         ComPtr<ID3D11DeviceContext> Context;
         ComPtr<ID3D11Texture2D> Texture;
         ComPtr<ID3D11RenderTargetView> View;
-        ComPtr<ID3D11Query> Done;           // event query: the GPU finished the frame
         uint32_t Width = 0;                 // physical pixels
         uint32_t Height = 0;
 
@@ -428,31 +439,102 @@ namespace Bench
             desc.SampleDesc.Count = 1;
             desc.Usage = D3D11_USAGE_DEFAULT;
             desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            D3D11_QUERY_DESC query = {};
-            query.Query = D3D11_QUERY_EVENT;
             if (FAILED(Device->CreateTexture2D(&desc, nullptr, &Texture)) ||
-                FAILED(Device->CreateRenderTargetView(Texture.Get(), nullptr, &View)) ||
-                FAILED(Device->CreateQuery(&query, &Done)))
+                FAILED(Device->CreateRenderTargetView(Texture.Get(), nullptr, &View)))
                 return false;
+
+            D3D11_QUERY_DESC disjoint = { D3D11_QUERY_TIMESTAMP_DISJOINT, 0 };
+            D3D11_QUERY_DESC timestamp = { D3D11_QUERY_TIMESTAMP, 0 };
+            for (GpuFrame& f : Ring)
+                if (FAILED(Device->CreateQuery(&disjoint, &f.Disjoint)) || FAILED(Device->CreateQuery(&timestamp, &f.Begin)) ||
+                    FAILED(Device->CreateQuery(&timestamp, &f.End)))
+                    return false;
             Width = width;
             Height = height;
             return true;
         }
 
-        void Clear() { Context->ClearRenderTargetView(View.Get(), BackgroundColor); }
-
-        // Marks the end of the frame and hands the recorded commands to the GPU.
-        void Submit()
+        // Before a frame: collects the finished frames without blocking; when GpuFramesInFlight frames are
+        // in flight, spins until the oldest one is done (never sleeps: a sleep costs a timer tick).
+        void WaitForSlot()
         {
-            Context->End(Done.Get());
+            while (Pending > 0 && CollectOldest(false))
+            {
+            }
+            if (Pending == GpuFramesInFlight)
+                CollectOldest(true);
+        }
+
+        // Right before the library renders: starts the frame's GPU interval and clears the target.
+        // The GPU time lands in *gpuMs once the GPU finished the frame (stays < 0 when the interval is disjoint).
+        void BeginFrame(double* gpuMs)
+        {
+            GpuFrame& f = Ring[Next];
+            f.Result = gpuMs;
+            Context->Begin(f.Disjoint.Get());
+            Context->End(f.Begin.Get());
+            Context->ClearRenderTargetView(View.Get(), BackgroundColor);
+        }
+
+        // Ends the interval and hands the recorded commands to the GPU.
+        void EndFrame()
+        {
+            GpuFrame& f = Ring[Next];
+            Context->End(f.End.Get());
+            Context->End(f.Disjoint.Get());
             Context->Flush();
+            Next = (Next + 1) % GpuFramesInFlight;
+            ++Pending;
         }
 
-        void WaitForGpu()
+        // Waits for every frame in flight: their results must land before the samples are read (or freed).
+        void Drain()
         {
-            while (Context->GetData(Done.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE)
-                YieldProcessor();
+            while (Pending > 0)
+                CollectOldest(true);
         }
+
+    private:
+        struct GpuFrame
+        {
+            ComPtr<ID3D11Query> Disjoint;   // the timestamps are only comparable if the GPU clock did not change
+            ComPtr<ID3D11Query> Begin;
+            ComPtr<ID3D11Query> End;
+            double* Result = nullptr;
+        };
+
+        // S_OK = data read, S_FALSE = not ready (only without wait), anything else = failed (device lost).
+        HRESULT Read(ID3D11Query* query, void* data, UINT size, bool wait)
+        {
+            HRESULT hr;
+            while ((hr = Context->GetData(query, data, size, D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE && wait)
+                YieldProcessor();
+            return hr;
+        }
+
+        // Reads the oldest frame in flight. False = the GPU has not finished it yet (only without wait).
+        bool CollectOldest(bool wait)
+        {
+            GpuFrame& f = Ring[(Next + GpuFramesInFlight - Pending) % GpuFramesInFlight];
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+            HRESULT hr = Read(f.Disjoint.Get(), &disjoint, sizeof(disjoint), wait);
+            if (hr == S_FALSE)
+                return false;
+            // The disjoint query ends after the timestamps: once it is done, they are too.
+            uint64_t begin = 0;
+            uint64_t end = 0;
+            bool valid = hr == S_OK && !disjoint.Disjoint && disjoint.Frequency > 0 && Read(f.Begin.Get(), &begin, sizeof(begin), true) == S_OK &&
+                         Read(f.End.Get(), &end, sizeof(end), true) == S_OK && end >= begin;
+            if (valid && f.Result)
+                *f.Result = double(end - begin) * 1000.0 / double(disjoint.Frequency);
+            f.Result = nullptr;
+            --Pending;
+            return true;
+        }
+
+        GpuFrame Ring[GpuFramesInFlight];
+        int Next = 0;                       // slot of the next frame
+        int Pending = 0;                    // frames in flight: the slots before Next
     };
 
     // ------------------------------------------------------------------------------------
@@ -1147,7 +1229,7 @@ namespace Bench
     enum class Mode : uint8_t
     {
         Display,        // the bench window, vsync: the overlay situation
-        Throughput,     // offscreen target, no Present, the CPU waits for the GPU every frame
+        Throughput,     // offscreen target, no Present, frames in flight, GPU time from timestamp queries
     };
 
     inline const char* ModeName(Mode mode) { return mode == Mode::Display ? "Display" : "Throughput"; }
@@ -1167,7 +1249,7 @@ namespace Bench
         virtual std::string Version() const = 0;
 
         // Display: draws into `window` and presents with vsync (max frame latency 1, waitable object).
-        // Throughput: draws into `target` (already cleared each frame), no Present.
+        // Throughput: draws into `target` (cleared by the runner right before EndFrame), no Present.
         virtual bool Open(Mode mode, const BenchWindow& window, const OffscreenTarget& target) = 0;
         virtual void Close() = 0;
         virtual void BeginScene(const Scene& scene) = 0;    // before the warmup of every scene
@@ -1256,18 +1338,22 @@ namespace Bench
         std::string Scene;
         uint64_t Items = 0;                 // primitives + controls
         int Frames = 0;
-        double Fps = 0;                     // throughput: 1000 / average frame time
-        Distribution IntervalMs;            // frame to frame (throughput: frame time, without scene generation)
+        double Fps = 0;                     // display: measured; throughput: 1000 / max(CPU frame ms, GPU ms)
+        double LoopFps = 0;                 // frames the loop really ran per second (throughput: without scene generation,
+                                            // until the GPU finished the last frame)
+        Distribution IntervalMs;            // frame to frame (throughput: CPU frame wall time, without generation and GPU wait)
         Distribution CyclesM;               // CPU megacycles of the frame loop thread per frame
         Distribution BuildMs;
         Distribution SubmitMs;
-        Distribution GpuWaitMs;             // throughput: spinning until the GPU finished
+        Distribution GpuWaitMs;             // throughput: spinning for the oldest frame in flight
+        Distribution GpuFrameMs;            // throughput: GPU time per frame from timestamp queries
+        int GpuFrames = 0;                  // throughput: frames with a valid (not disjoint) GPU time
         double CpuMs = 0;                   // average CPU-busy time of the frame loop thread
         double ProcessCpuPercent = 0;       // all threads, % of one core over the whole loop
         double OtherCpuPercent = 0;         // the same without the frame loop thread (driver / runtime threads)
         double GpuPercent = -1;             // 3D engine of this process; < 0 = unavailable
-        double GpuMs = -1;                  // display: GpuPercent x average frame interval
-        double HeadroomFps = 0;             // display: 1000 / max(CpuMs, GpuMs)
+        double GpuMs = -1;                  // display: GpuPercent x average frame interval; throughput: GpuFrameMs.Avg
+        double HeadroomFps = 0;             // display: 1000 / max(CpuMs, GpuMs); throughput: Fps
         MemoryUsage Memory;                 // process, at the end of the scene
         double Vertices = 0;                // average per frame, where the library exposes them
         double Indices = 0;
@@ -1288,33 +1374,48 @@ namespace Bench
         return Format("%.*f/%.*f/%.*f", decimals, d.Avg, decimals, d.P95, decimals, d.P99);
     }
 
-    inline constexpr const char* Legend =
-        "How to read (lower is better unless noted):\n"
-        "  Display     the bench window with vsync - the overlay situation. FPS is capped by the refresh rate:\n"
-        "              compare the costs, not the FPS.\n"
-        "  Throughput  offscreen target, no Present, the CPU waits for the GPU after every frame:\n"
-        "              FPS (higher = better) = 1000 / average frame time, the real CPU + GPU cost of a frame,\n"
-        "              as when embedded in a game.\n"
-        "  Interval    time between frames p50/p95/p99, ms. A high p99 means stutter. Throughput: frame time,\n"
-        "              from the end of scene generation until the GPU finished the frame.\n"
-        "  CPU Mcyc    CPU megacycles of the render thread per frame avg/p95: the whole frame loop except scene\n"
-        "              generation, incl. BeginFrame/message pump/Present; blocking waits cost nothing.\n"
-        "              CPU ms is the same average in milliseconds at the measured cycle clock.\n"
-        "  Build       the UI code: after BeginFrame/NewFrame .. before EndFrame/Render, ms avg/p95/p99.\n"
-        "  Submit      EndFrame, or Render + RenderDrawData + Present (throughput: + flush), ms avg/p95/p99.\n"
-        "  GPU wait    throughput: the CPU spinning until the GPU finished the frame (not in CPU Mcyc).\n"
-        "  Proc CPU    display: CPU time of all threads of the process (incl. driver threads and scene\n"
-        "              generation), % of one core over the whole loop.\n"
-        "  Other CPU   throughput: the same without the render thread, which never blocks (it spins on the GPU;\n"
-        "              its cost is CPU Mcyc): driver and runtime threads. Both tick at ~16 ms: noisy on short runs.\n"
-        "  GPU %, ms   3D-engine utilization of this process over the whole loop; GPU ms = GPU % x frame interval\n"
-        "              (display only).\n"
-        "  Headroom    1000 / max(CPU ms, GPU ms): the FPS this frame cost would allow without vsync (higher = better).\n"
-        "  Memory      of the whole process at the end of each scene (MB): working set, peak working set,\n"
-        "              private bytes, GPU local memory (- = unavailable). Cumulative over the run: scenes run in\n"
-        "              the listed order.\n"
-        "  Vtx/Idx     vertices / indices per frame (Dear ImGui draw data).\n"
-        "  Items       primitives + controls per frame.\n";
+    // The ring depth is filled in from GpuFramesInFlight, so the text cannot drift from the code.
+    inline std::string Legend()
+    {
+        return Format(
+            "How to read (lower is better unless noted):\n"
+            "  Display     the bench window with vsync - the overlay situation. FPS is capped by the refresh rate:\n"
+            "              compare the costs, not the FPS.\n"
+            "  Throughput  offscreen target, no Present, up to %d frames in flight (the CPU waits for the GPU only when\n"
+            "              it is that far ahead); the GPU time of every frame comes from timestamp queries.\n"
+            "              FPS (higher = better) = 1000 / max(CPU frame ms avg, GPU ms avg): what the frame cost allows\n"
+            "              when embedded in a game, where CPU and GPU work in parallel. The Ramp uses this FPS too.\n"
+            "  Loop FPS    throughput: frames the loop really ran per second, until the GPU finished the last one\n"
+            "              (without scene generation). Close to FPS = the GPU was fed continuously; lower = it idled\n"
+            "              (finished frames noticed late) or the clocks dropped.\n"
+            "  Interval    display: time between frames p50/p95/p99, ms. A high p99 means stutter.\n"
+            "  CPU frame   throughput: wall time of the CPU part of a frame p50/p95/p99, ms: BeginFrame .. flush,\n"
+            "              without scene generation and GPU wait.\n"
+            "  CPU Mcyc    CPU megacycles of the render thread per frame avg/p95: the whole frame loop except scene\n"
+            "              generation, incl. BeginFrame/message pump/Present; blocking waits cost nothing.\n"
+            "              CPU ms is the same average in milliseconds at the measured cycle clock.\n"
+            "  Build       the UI code: after BeginFrame/NewFrame .. before EndFrame/Render, ms avg/p95/p99.\n"
+            "  Submit      EndFrame, or Render + RenderDrawData + Present (throughput: + clear, timestamps, flush),\n"
+            "              ms avg/p95/p99.\n"
+            "  GPU ms      throughput: GPU time of a frame avg/p95 from timestamps (clear .. last draw), exact;\n"
+            "              intervals with a GPU clock change (disjoint) are discarded. Display: GPU %% x frame interval.\n"
+            "  GPU wait    throughput: the CPU spinning for the oldest frame in flight when all %d are in flight\n"
+            "              (not in CPU Mcyc, CPU frame or FPS).\n"
+            "  Proc CPU    display: CPU time of all threads of the process (incl. driver threads and scene\n"
+            "              generation), %% of one core over the whole loop.\n"
+            "  Other CPU   throughput: the same without the render thread, which spins instead of blocking when it\n"
+            "              waits for the GPU (its cost is CPU Mcyc): driver and runtime threads. Both tick at ~16 ms:\n"
+            "              noisy on short runs.\n"
+            "  GPU %%       3D-engine utilization of this process over the whole loop (PDH).\n"
+            "  Headroom    display: 1000 / max(CPU ms, GPU ms): the FPS this frame cost would allow without vsync\n"
+            "              (higher = better).\n"
+            "  Memory      of the whole process at the end of each scene (MB): working set, peak working set,\n"
+            "              private bytes, GPU local memory (- = unavailable). Cumulative over the run: scenes run in\n"
+            "              the listed order.\n"
+            "  Vtx/Idx     vertices / indices per frame (Dear ImGui draw data).\n"
+            "  Items       primitives + controls per frame.\n",
+            GpuFramesInFlight, GpuFramesInFlight);
+    }
 
     // ------------------------------------------------------------------------------------
     // Runner: the frame loop, scenes, modes and the report
@@ -1322,12 +1423,13 @@ namespace Bench
 
     struct FrameSample
     {
-        int64_t Start = 0;                  // QPC after scene generation
-        int64_t End = 0;                    // QPC at the end of the frame
+        int64_t Start = 0;                  // QPC after scene generation (throughput: and after the GPU wait)
+        int64_t End = 0;                    // QPC at the end of the frame (throughput: after the flush)
         uint64_t Cycles = 0;                // CPU cycles of this thread for the measured part
         int64_t Build = 0;                  // QPC ticks
         int64_t Submit = 0;
-        int64_t GpuWait = 0;
+        int64_t GpuWait = 0;                // throughput: waiting for a free timestamp slot, before Start
+        double GpuMs = -1;                  // throughput: from timestamps, written a few frames later; < 0 = disjoint
     };
 
     class Runner
@@ -1338,6 +1440,10 @@ namespace Bench
         int Run()
         {
             SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            // Windows 11 may ignore timeBeginPeriod while all windows of the process are hidden (the throughput mode).
+            PROCESS_POWER_THROTTLING_STATE throttling = { PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                                                          PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, 0 };
+            SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
             if (!Opt.Only.empty() && SelectedScenes(Mode::Throughput).empty())
             {
                 std::printf("Unknown scene: %s\n\n", Opt.Only.c_str());
@@ -1399,7 +1505,7 @@ namespace Bench
                       "           Dear ImGui effect layers %d\n",
                       Opt.Scale, Opt.Warmup, MinWarmupMs / 1000, Opt.MeasuredFrames(DefaultDisplayFrames),
                       Opt.MeasuredFrames(DefaultThroughputFrames), Opt.RampFrames(), Opt.Layers);
-            Out.Print("\n%s\nDo not move the mouse (it is placed in the middle of the window). Esc aborts.\n", Legend);
+            Out.Print("\n%s\nDo not move the mouse (it is placed in the middle of the window). Esc aborts.\n", Legend().c_str());
         }
 
         bool RunMode(Mode mode)
@@ -1420,8 +1526,12 @@ namespace Bench
             bool ok = Lib.Open(mode, Window, Target);
             if (!ok)
                 Out.Print("%s failed to initialize in %s mode.\n", Lib.Name(), ModeName(mode));
+            // Throughput: finished frames are noticed at the timer tick, every 1 ms instead of ~15.6 ms.
+            bool fineTimer = mode == Mode::Throughput && timeBeginPeriod(1) == TIMERR_NOERROR;
             for (size_t i = 0; ok && i < scenes.size(); ++i)
                 ok = scenes[i]->Id == SceneId::Ramp ? RunRamp(*scenes[i]) : RunScene(*scenes[i], mode);
+            if (fineTimer)
+                timeEndPeriod(1);
             Lib.Close();
 
             if (mode == Mode::Display)
@@ -1446,7 +1556,7 @@ namespace Bench
             return true;
         }
 
-        // Doubling object counts until the frame rate drops below 20 FPS.
+        // Doubling object counts until the throughput FPS drops below 20.
         bool RunRamp(const Scene& scene)
         {
             for (int step = 0; step <= 8; ++step)
@@ -1480,13 +1590,14 @@ namespace Bench
             int64_t warmupStart = Now();
             for (int i = 0; i < Opt.Warmup || TicksToMs(Now() - warmupStart) < MinWarmupMs; ++i)
                 if (!RunFrame(scene, mode, rampCount, frame++, sample))
-                    return false;
+                    return Stop();
+            Target.Drain(); // the warmup frames in flight write into `sample`
 
             // Collecting the counters takes a while: two more frames restore the frame pacing after it.
             Gpu.Start();
             for (int i = 0; i < 2; ++i)
                 if (!RunFrame(scene, mode, rampCount, frame++, sample))
-                    return false;
+                    return Stop();
             int64_t start = sample.End;
             uint64_t cpuStart = ProcessCpuTime();
             uint64_t threadStart = ThreadCpuTime();
@@ -1497,7 +1608,7 @@ namespace Bench
             for (FrameSample& s : samples)
             {
                 if (!RunFrame(scene, mode, rampCount, frame++, s))
-                    return false;
+                    return Stop();
                 DrawCounts counts = Lib.LastDrawCounts();
                 vertices += double(counts.Vertices);
                 indices += double(counts.Indices);
@@ -1506,10 +1617,16 @@ namespace Bench
             uint64_t threadEnd = ThreadCpuTime();
             double gpuPercent = Gpu.Stop();
             double wallMs = TicksToMs(samples.back().End - start);
+            // The GPU times of the last frames. The loop ends when the GPU finished them: with a deep ring, leaving
+            // them out would overstate the Loop FPS of GPU-bound scenes.
+            int64_t drainStart = Now();
+            Target.Drain();
+            double drainMs = TicksToMs(Now() - drainStart);
 
-            // Display: frame to frame, so that pacing and stutter show. Throughput: the frame alone, without scene generation.
+            // Display: frame to frame, so that pacing and stutter show. Throughput: the CPU part of the frame alone.
             bool display = mode == Mode::Display;
-            std::vector<double> interval, cycles, build, submit, gpuWait;
+            std::vector<double> interval, cycles, build, submit, gpuWait, gpuFrame;
+            double loopMs = drainMs;
             int64_t previous = start;
             for (const FrameSample& s : samples)
             {
@@ -1518,6 +1635,9 @@ namespace Bench
                 build.push_back(TicksToMs(s.Build));
                 submit.push_back(TicksToMs(s.Submit));
                 gpuWait.push_back(TicksToMs(s.GpuWait));
+                if (s.GpuMs >= 0)
+                    gpuFrame.push_back(s.GpuMs);
+                loopMs += TicksToMs(s.End - s.Start + s.GpuWait);
                 previous = s.End;
             }
 
@@ -1526,14 +1646,15 @@ namespace Bench
             r.Items = Model.Items();
             r.Frames = frames;
             r.IntervalMs = Summarize(std::move(interval));
-            r.Fps = display ? frames * 1000.0 / wallMs : 1000 / r.IntervalMs.Avg;
             r.CyclesM = Summarize(std::move(cycles));
             r.BuildMs = Summarize(std::move(build));
             r.SubmitMs = Summarize(std::move(submit));
             r.GpuWaitMs = Summarize(std::move(gpuWait));
+            r.GpuFrames = int(gpuFrame.size());
+            r.GpuFrameMs = Summarize(std::move(gpuFrame));
             r.CpuMs = r.CyclesM.Avg * 1e6 / System.CyclesPerMs;
-            // Throughput reports the other threads: the frame loop thread never blocks there (it spins on the GPU),
-            // and its own cost is CPU Mcyc.
+            // Throughput reports the other threads: the frame loop thread never blocks there (it spins when it
+            // waits for the GPU), and its own cost is CPU Mcyc.
             uint64_t processCpu = cpuEnd - cpuStart;
             uint64_t otherCpu = processCpu - std::min(processCpu, threadEnd - threadStart);
             r.ProcessCpuPercent = double(processCpu) / 1e4 / wallMs * 100; // 100 ns units -> ms
@@ -1541,13 +1662,30 @@ namespace Bench
             r.GpuPercent = gpuPercent;
             if (display)
             {
+                r.Fps = frames * 1000.0 / wallMs;
+                r.LoopFps = r.Fps;
                 r.GpuMs = gpuPercent < 0 ? -1 : gpuPercent / 100 * r.IntervalMs.Avg;
                 r.HeadroomFps = 1000 / std::max(r.CpuMs, r.GpuMs);
+            }
+            else
+            {
+                // CPU and GPU overlap when embedded: the slower of the two sets the frame rate.
+                r.LoopFps = frames * 1000.0 / loopMs;
+                r.GpuMs = r.GpuFrames > 0 ? r.GpuFrameMs.Avg : -1;
+                r.Fps = 1000 / std::max(r.IntervalMs.Avg, r.GpuMs);
+                r.HeadroomFps = r.Fps;
             }
             r.Memory = QueryMemory(Adapter.Get());
             r.Vertices = vertices / frames;
             r.Indices = indices / frames;
             return true;
+        }
+
+        // An aborted scene: the frames in flight still point into its samples.
+        bool Stop()
+        {
+            Target.Drain();
+            return false;
         }
 
         bool RunFrame(const Scene& scene, Mode mode, uint32_t rampCount, uint32_t frame, FrameSample& s)
@@ -1557,26 +1695,29 @@ namespace Bench
             GenerateFrame(scene, frame, Opt.Scale, rampCount, Model); // not measured
 
             bool offscreen = mode == Mode::Throughput;
-            s.Start = Now();
-            uint64_t cycles = ThreadCycles();
+            int64_t waitStart = Now();
             if (offscreen)
-                Target.Clear();
+                Target.WaitForSlot();
+            s.Start = Now();
+            s.GpuWait = s.Start - waitStart;
+            s.GpuMs = -1;
+            uint64_t cycles = ThreadCycles();
             if (!Lib.BeginFrame())
                 return false;
             int64_t buildStart = Now();
             Lib.Build(Model);
             int64_t submitStart = Now();
+            // The GPU interval starts right before the library renders: neither library issues GPU commands earlier,
+            // and an earlier start could include GPU idle time while the CPU builds.
+            if (offscreen)
+                Target.BeginFrame(&s.GpuMs);
             Lib.EndFrame();
             if (offscreen)
-                Target.Submit();
-            int64_t submitEnd = Now();
-            s.Cycles = ThreadCycles() - cycles;
-            if (offscreen)
-                Target.WaitForGpu();
+                Target.EndFrame();
             s.End = Now();
+            s.Cycles = ThreadCycles() - cycles;
             s.Build = submitStart - buildStart;
-            s.Submit = submitEnd - submitStart;
-            s.GpuWait = s.End - submitEnd;
+            s.Submit = s.End - submitStart;
             return true;
         }
 
@@ -1587,7 +1728,8 @@ namespace Bench
             if (r.Mode == Mode::Display)
                 Out.Print("   GPU %s ms   headroom %.0f FPS\n", OrDash(r.GpuMs, 3).c_str(), r.HeadroomFps);
             else
-                Out.Print("   GPU wait %7.3f\n", r.GpuWaitMs.Avg);
+                Out.Print("   frame %7.3f   GPU %s ms   loop %.1f FPS%s\n", r.IntervalMs.Avg, OrDash(r.GpuMs, 3).c_str(), r.LoopFps,
+                          r.GpuFrames < r.Frames ? Format("   (%d disjoint GPU intervals discarded)", r.Frames - r.GpuFrames).c_str() : "");
         }
 
         void PrintSummary()
@@ -1601,8 +1743,8 @@ namespace Bench
                 bool display = mode == Mode::Display;
                 Table timing(display ? std::vector<std::string>{ "Scene", "Items", "FPS", "Interval p50/95/99", "CPU Mcyc avg/p95", "CPU ms",
                                                                  "Proc CPU %", "GPU %", "GPU ms", "Headroom FPS" }
-                                     : std::vector<std::string>{ "Scene", "Items", "FPS", "Frame ms p50/95/99", "CPU Mcyc avg/p95", "CPU ms",
-                                                                 "GPU wait ms", "Other CPU %", "GPU %" });
+                                     : std::vector<std::string>{ "Scene", "Items", "FPS", "Loop FPS", "CPU frame ms p50/95/99", "CPU Mcyc avg/p95",
+                                                                 "CPU ms", "GPU ms avg/p95", "GPU wait ms", "Other CPU %", "GPU %" });
                 std::vector<std::string> costHeader = { "Scene", "Build ms avg/p95/p99", "Submit ms avg/p95/p99", "WS MB", "Peak WS MB",
                                                         "Private MB", "GPU MB" };
                 if (drawCounts)
@@ -1620,8 +1762,9 @@ namespace Bench
                         timing.Add({ r.Scene, std::to_string(r.Items), Fixed(r.Fps, 1), Percentiles(r.IntervalMs, 2), cycles, Fixed(r.CpuMs, 3),
                                      Fixed(r.ProcessCpuPercent, 1), OrDash(r.GpuPercent, 1), OrDash(r.GpuMs, 3), Fixed(r.HeadroomFps, 0) });
                     else
-                        timing.Add({ r.Scene, std::to_string(r.Items), Fixed(r.Fps, 1), Percentiles(r.IntervalMs, 3), cycles, Fixed(r.CpuMs, 3),
-                                     Fixed(r.GpuWaitMs.Avg, 3), Fixed(r.OtherCpuPercent, 1), OrDash(r.GpuPercent, 1) });
+                        timing.Add({ r.Scene, std::to_string(r.Items), Fixed(r.Fps, 1), Fixed(r.LoopFps, 1), Percentiles(r.IntervalMs, 3), cycles,
+                                     Fixed(r.CpuMs, 3), GpuFrameText(r), Fixed(r.GpuWaitMs.Avg, 3), Fixed(r.OtherCpuPercent, 1),
+                                     OrDash(r.GpuPercent, 1) });
                     std::vector<std::string> row = { r.Scene, AvgPercentiles(r.BuildMs, 3), AvgPercentiles(r.SubmitMs, 3),
                                                      Megabytes(r.Memory.WorkingSet), Megabytes(r.Memory.PeakWorkingSet),
                                                      Megabytes(r.Memory.Private), OrDash(GpuLocalMb(r.Memory), 1) };
@@ -1641,10 +1784,12 @@ namespace Bench
         {
             if (RampSteps.empty())
                 return;
-            Table table({ "Objects", "FPS", "Frame ms p50/95/99", "CPU ms", "GPU wait ms", "Other CPU %", "WS MB", "GPU MB" });
+            Table table({ "Objects", "FPS", "Loop FPS", "CPU frame ms p50/95/99", "CPU ms", "GPU ms avg/p95", "GPU wait ms", "Other CPU %",
+                          "WS MB", "GPU MB" });
             for (const SceneResult& r : RampSteps)
-                table.Add({ std::to_string(r.Items), Fixed(r.Fps, 1), Percentiles(r.IntervalMs, 3), Fixed(r.CpuMs, 3), Fixed(r.GpuWaitMs.Avg, 3),
-                            Fixed(r.OtherCpuPercent, 1), Megabytes(r.Memory.WorkingSet), OrDash(GpuLocalMb(r.Memory), 1) });
+                table.Add({ std::to_string(r.Items), Fixed(r.Fps, 1), Fixed(r.LoopFps, 1), Percentiles(r.IntervalMs, 3), Fixed(r.CpuMs, 3),
+                            GpuFrameText(r), Fixed(r.GpuWaitMs.Avg, 3), Fixed(r.OtherCpuPercent, 1), Megabytes(r.Memory.WorkingSet),
+                            OrDash(GpuLocalMb(r.Memory), 1) });
             Out.Print("\n%s %s - Ramp (throughput, %d frames per step; rects, circles, lines and texts in equal parts):\n", Lib.Name(),
                       Lib.Version().c_str(), RampSteps.front().Frames);
             Out.Write(table.Render() + "\n");
@@ -1653,7 +1798,7 @@ namespace Bench
             if (System.RefreshRate && std::find(targets.begin(), targets.end(), System.RefreshRate) == targets.end())
                 targets.push_back(System.RefreshRate);
             for (uint32_t fps : targets)
-                Out.Print("  Most objects at >= %u FPS%s: %s\n", fps, fps == System.RefreshRate ? " (your refresh rate)" : "",
+                Out.Print("  Most objects at >= %u throughput FPS%s: %s\n", fps, fps == System.RefreshRate ? " (your refresh rate)" : "",
                           RampCapacity(fps).c_str());
         }
 
@@ -1675,16 +1820,27 @@ namespace Bench
             return Format("%llu (interpolated ~%.0f)", (unsigned long long)a.Items, estimate);
         }
 
+        static std::string GpuFrameText(const SceneResult& r)
+        {
+            return r.GpuFrames > 0 ? Format("%.3f/%.3f", r.GpuFrameMs.Avg, r.GpuFrameMs.P95) : std::string("-");
+        }
+
         std::string CsvLine(const SceneResult& r) const
         {
+            // Throughput-only columns are -1 in display rows.
+            const Distribution& g = r.GpuFrameMs;
+            bool gpu = r.GpuFrames > 0;
+            std::string extra = Format(",%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%d\n", r.LoopFps, gpu ? g.Avg : -1, gpu ? g.P50 : -1, gpu ? g.P95 : -1,
+                                       gpu ? g.P99 : -1, gpu ? g.Max : -1, r.Mode == Mode::Display ? -1 : r.GpuFrames);
             return Format("%s,%s,%s,%s,%llu,%d,%.2f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.2f,%.2f,%.2f,%.4f,"
-                          "%.1f,%.2f,%.2f,%.2f,%.2f,%.0f,%.0f\n",
+                          "%.1f,%.2f,%.2f,%.2f,%.2f,%.0f,%.0f",
                           Lib.Name(), Lib.Version().c_str(), ModeName(r.Mode), r.Scene.c_str(), (unsigned long long)r.Items, r.Frames, r.Fps,
                           r.IntervalMs.Avg, r.IntervalMs.P50, r.IntervalMs.P95, r.IntervalMs.P99, r.IntervalMs.Max, r.CyclesM.Avg, r.CyclesM.P95,
                           r.CpuMs, r.BuildMs.Avg, r.BuildMs.P95, r.BuildMs.P99, r.SubmitMs.Avg, r.SubmitMs.P95, r.SubmitMs.P99, r.GpuWaitMs.Avg,
                           r.ProcessCpuPercent, r.OtherCpuPercent, r.GpuPercent, r.GpuMs, r.HeadroomFps, double(r.Memory.WorkingSet) / 1048576.0,
                           double(r.Memory.PeakWorkingSet) / 1048576.0, double(r.Memory.Private) / 1048576.0, GpuLocalMb(r.Memory),
-                          r.Vertices, r.Indices);
+                          r.Vertices, r.Indices) +
+                   extra;
         }
 
         // "<ExeName>_results.txt" next to the exe: the report followed by a CSV block.
@@ -1696,7 +1852,8 @@ namespace Bench
                                "library,version,mode,scene,items,frames,fps,interval_avg_ms,interval_p50_ms,interval_p95_ms,interval_p99_ms,"
                                "interval_max_ms,cpu_mcycles_avg,cpu_mcycles_p95,cpu_ms,build_avg_ms,build_p95_ms,build_p99_ms,submit_avg_ms,"
                                "submit_p95_ms,submit_p99_ms,gpu_wait_avg_ms,process_cpu_pct,other_cpu_pct,gpu_pct,gpu_ms,headroom_fps,working_set_mb,"
-                               "peak_working_set_mb,private_mb,gpu_local_mb,vertices,indices\n";
+                               "peak_working_set_mb,private_mb,gpu_local_mb,vertices,indices,loop_fps,gpu_frame_avg_ms,gpu_frame_p50_ms,"
+                               "gpu_frame_p95_ms,gpu_frame_p99_ms,gpu_frame_max_ms,gpu_frames\n";
             for (const SceneResult& r : Results)
                 text += CsvLine(r);
             for (const SceneResult& r : RampSteps)

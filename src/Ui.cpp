@@ -153,55 +153,119 @@ namespace Funky
             ui.HoveredPanel = ui.Interactive ? PanelAt(ui, ui.Pointer, ui.FrameIndex - 1) : 0;
         }
 
-        uint32_t ScaleAlpha(uint32_t color, float opacity)
+        // The run the next instances of this kind go to: the last one if it has the same layer and kind.
+        DrawRun* CurrentRun(UiImpl& ui, uint32_t kind, uint32_t first)
         {
-            return (color & 0x00FFFFFFu) | (uint32_t(float(color >> 24) * opacity + 0.5f) << 24);
+            if (!ui.Runs.IsEmpty() && ui.Runs.Back().Layer == ui.CurrentLayer && ui.Runs.Back().Kind == kind)
+                return &ui.Runs.Back();
+            return ui.Runs.Push({ ui.CurrentLayer, kind, first, 0, { NoClip, NoClip, -NoClip, -NoClip } });
         }
 
-        // Appends the runs of one layer to FinalShapes (reserved by BuildFrame).
-        void AppendLayer(UiImpl& ui, uint64_t layer, float opacity)
+        // Appends a batch to a list, merging it into the last one when it continues that one.
+        void AddBatch(DrawBatch* batches, uint32_t& count, const DrawBatch& batch)
         {
-            if (opacity <= 0)
-                return; // e.g. a panel's sizing pass
-            for (const ShapeRun& run : ui.Runs)
+            if (batch.Count == 0)
+                return;
+            DrawBatch* last = count ? &batches[count - 1] : nullptr;
+            if (last && last->Kind == batch.Kind && last->Opacity == batch.Opacity && last->First + last->Count == batch.First)
+                last->Count += batch.Count;
+            else
+                batches[count++] = batch;
+        }
+
+        // Turns runs, fed in paint order, into batches by kind, like Zed's GPUI. The runs are cut into
+        // levels; a level draws all its shapes, then all its glyphs. So text moves after the shapes fed
+        // later in its level, which is fine as long as they do not overlap it: a shape overlapping text of
+        // the current level (e.g. a highlight over a label, or a panel over another panel's text) starts
+        // the next level. A panel of labels, sliders and buttons is usually one level: two draw calls.
+        class Batcher
+        {
+        public:
+            explicit Batcher(Array<DrawBatch>& batches) : Batches(batches) {}
+
+            void AddShapes(const GpuShape* shapes, uint32_t first, uint32_t count, float opacity)
             {
-                if (run.Layer != layer || run.Count == 0)
-                    continue;
-                GpuShape* out = ui.FinalShapes.Append(run.Count);
-                MemCopy(out, ui.Shapes.Data + run.First, sizeof(GpuShape) * run.Count);
-                if (opacity >= 1)
-                    continue;
-                for (uint32_t i = 0; i < run.Count; ++i)
+                uint32_t start = first;
+                for (uint32_t i = first; i < first + count && TextCount > 0; ++i)
                 {
-                    GpuShape& s = out[i];
-                    s.Fill0 = ScaleAlpha(s.Fill0, opacity);
-                    s.Fill1 = ScaleAlpha(s.Fill1, opacity);
-                    s.Stroke = ScaleAlpha(s.Stroke, opacity);
-                    s.Glow = ScaleAlpha(s.Glow, opacity);
+                    if (OverlapsText(shapes[i].Bounds))
+                    {
+                        Emit({ BatchShapes, start, i - start, opacity });
+                        EndLevel();
+                        start = i;
+                    }
                 }
+                Emit({ BatchShapes, start, first + count - start, opacity });
             }
+
+            void AddGlyphs(uint32_t first, uint32_t count, const ClipRect& bounds, float opacity)
+            {
+                if (TextCount == MaxLevelTexts)
+                    EndLevel(); // bounds the overlap tests per shape
+                Texts[TextCount++] = bounds;
+                AddBatch(Glyphs, GlyphCount, { BatchGlyphs, first, count, opacity });
+            }
+
+            void EndLevel()
+            {
+                for (uint32_t i = 0; i < GlyphCount; ++i)
+                    Emit(Glyphs[i]);
+                TextCount = GlyphCount = 0;
+            }
+
+        private:
+            static constexpr uint32_t MaxLevelTexts = 32;
+
+            // Touching counts as overlapping: a pixel on the shared edge must keep its order.
+            bool OverlapsText(const float* bounds) const
+            {
+                for (uint32_t i = 0; i < TextCount; ++i)
+                {
+                    const ClipRect& t = Texts[i];
+                    if (bounds[0] <= t.MaxX && t.MinX <= bounds[2] && bounds[1] <= t.MaxY && t.MinY <= bounds[3])
+                        return true;
+                }
+                return false;
+            }
+
+            void Emit(const DrawBatch& batch)
+            {
+                // Room for one more first: AddBatch then merges or appends.
+                if (batch.Count > 0 && Batches.Reserve(Batches.Count + 1))
+                    AddBatch(Batches.Data, Batches.Count, batch);
+            }
+
+            Array<DrawBatch>& Batches;
+            ClipRect Texts[MaxLevelTexts];      // bounds of the level's glyph runs
+            DrawBatch Glyphs[MaxLevelTexts];    // the level's glyph batches, drawn after its shapes
+            uint32_t TextCount = 0;
+            uint32_t GlyphCount = 0;
+        };
+
+        // XXH64's lane round: the data word is multiplied off the dependency chain.
+        constexpr uint64_t HashPrime1 = 0x9E3779B185EBCA87ull;
+        constexpr uint64_t HashPrime2 = 0xC2B2AE3D27D4EB4Full;
+
+        uint64_t HashRound(uint64_t lane, const uint8_t* word)
+        {
+            uint64_t w;
+            MemCopy(&w, word, 8);
+            return std::rotl(lane + w * HashPrime2, 31) * HashPrime1;
         }
 
         // Presents the frame unless it is identical to the last presented one. An embedded target is
         // redrawn by the client every frame, so it always gets the UI.
-        void Present(UiImpl& ui)
+        void Present(UiImpl& ui, uint64_t hash)
         {
-            uint64_t hash = 0;
             if (!ui.Embedded)
             {
-                float view[3] = { ui.Viewport.X, ui.Viewport.Y, ui.Scale };
-                hash = HashMemory(ui.FinalShapes.Data, sizeof(GpuShape) * ui.FinalShapes.Count);
-                hash = HashMemory(ui.Clips.Data, sizeof(ClipRect) * ui.Clips.Count, hash);
-                hash = HashMemory(ui.Points.Data, sizeof(Vec2) * ui.Points.Count, hash);
-                hash = HashMemory(ui.Batches.Data, sizeof(DrawBatch) * ui.Batches.Count, hash);
-                hash = HashMemory(view, sizeof(view), hash);
-
                 ui.PresentedLastFrame = false;
                 if (!ui.Window.IsVisible() || (hash == ui.LastFrameHash && !ui.ForceRedraw))
                     return;
             }
-            ui.PresentedLastFrame = ui.Gpu.Render(ui.FinalShapes.Data, ui.FinalShapes.Count, ui.Batches.Data, ui.Batches.Count,
-                                                  ui.Clips.Data, ui.Clips.Count, ui.Points.Data, ui.Points.Count, ui.Scale);
+            FrameData frame = { ui.Shapes.Data, ui.Shapes.Count, ui.Glyphs.Data, ui.Glyphs.Count, ui.Points.Data, ui.Points.Count,
+                                ui.Clips.Data, ui.Clips.Count, ui.Batches.Data, ui.Batches.Count, ui.Scale };
+            ui.PresentedLastFrame = ui.Gpu.Render(frame);
             if (ui.PresentedLastFrame)
             {
                 ui.LastFrameHash = hash;
@@ -297,10 +361,10 @@ namespace Funky
         PanelOrder.Free();
         OpenContainers.Free();
         Shapes.Free();
+        Glyphs.Free();
         Runs.Free();
         Clips.Free();
         Points.Free();
-        FinalShapes.Free();
         Batches.Free();
         Frame.Free();
         Scratch.Free();
@@ -342,10 +406,13 @@ namespace Funky
 
         ui.Frame.Reset();
         ui.Shapes.Clear();
+        ui.Glyphs.Clear();
         ui.Runs.Clear();
         ui.Clips.Clear();
         ui.Clips.Push({ -NoClip, -NoClip, NoClip, NoClip });
         ui.Points.Clear();
+        ui.Hash.Reset();
+        ui.HashedShapes = ui.HashedGlyphs = ui.HashedPoints = ui.HashedClips = 0;
         ui.CurrentClip = 0;
         ui.CurrentLayer = 0;
         ui.WidgetHoveredThisFrame = false;
@@ -378,8 +445,24 @@ namespace Funky
             ui.Window.SetPointerCapture(ui.ActiveId != 0);
         }
 
+        FK_PROFILE(FrameProfile& profile = ui.Gpu.Profile(); profile = {}; int64_t buildStart = ProfileTicks();)
         ui.BuildFrame();
-        // A recreated device starts without the atlas.
+        // The frame's content was folded into the hash as it was emitted; the paint order, the panels'
+        // opacity (both in the batches), the counts and the viewport complete it. Embedded never skips.
+        uint64_t hash = 0;
+        if (!ui.Embedded)
+        {
+            ui.FoldEmitted();
+            float view[4] = { ui.Viewport.X, ui.Viewport.Y, ui.Scale, 0 };
+            uint32_t counts[4] = { ui.Shapes.Count, ui.Glyphs.Count, ui.Points.Count, ui.Clips.Count };
+            ui.Hash.Fold(ui.Batches.Data, sizeof(DrawBatch) * ui.Batches.Count);
+            ui.Hash.Fold(view, sizeof(view));
+            ui.Hash.Fold(counts, sizeof(counts));
+            hash = ui.Hash.Finish();
+        }
+        FK_PROFILE(profile.Build = ProfileTicks() - buildStart;)
+
+        // A recreated device starts without the atlas; a changed atlas changes the pixels.
         if (ui.Gpu.RestoreDevice())
         {
             ui.Text.InvalidateAtlas();
@@ -391,25 +474,98 @@ namespace Funky
             ui.Gpu.UpdateAtlas(atlas);
             ui.ForceRedraw = true;
         }
-        Present(ui);
+        Present(ui, hash);
         CollectGarbage(ui);
-        ui.Text.EndFrame(ui.FrameIndex);
+        ui.Text.EndFrame();
     }
 
+    // The batches in paint order: background, panels by z-order, foreground. The GPU reads Shapes and
+    // Glyphs as emitted, so nothing is copied; a panel's opacity goes with its batches.
     void UiImpl::BuildFrame()
     {
-        FinalShapes.Clear();
         Batches.Clear();
-        if (!FinalShapes.Reserve(Shapes.Count))
-            return;
-        AppendLayer(*this, 0, 1);
+        Batcher batcher(Batches);
+        auto layer = [&](uint64_t id, float opacity, uint32_t firstRun, uint32_t endRun)
+        {
+            for (uint32_t i = firstRun; i < endRun; ++i)
+            {
+                const DrawRun& run = Runs[i];
+                if (run.Layer != id)
+                    continue;
+                if (run.Kind == BatchShapes)
+                    batcher.AddShapes(Shapes.Data, run.First, run.Count, opacity);
+                else
+                    batcher.AddGlyphs(run.First, run.Count, run.Bounds, opacity);
+            }
+        };
+
+        layer(0, 1, 0, Runs.Count);
         for (uint64_t id : PanelOrder)
-            if (const PanelState* panel = Panels.Find(id))
-                AppendLayer(*this, id, panel->Opacity);
-        AppendLayer(*this, ForegroundLayer, 1);
-        if (FinalShapes.Count)
-            Batches.Push({ 0, FinalShapes.Count, 0 });
+        {
+            // Skipped: panels not submitted this frame, and a panel's invisible sizing pass (opacity 0).
+            const PanelState* panel = Panels.Find(id);
+            if (panel && panel->LastFrame == FrameIndex && panel->Opacity > 0)
+                layer(id, panel->Opacity, panel->FirstRun, panel->EndRun);
+        }
+        layer(ForegroundLayer, 1, 0, Runs.Count);
+        batcher.EndLevel();
     }
+
+    // ------------------------------------------------------------------------------------
+    // Frame hash (XXH64-style: four independent lanes keep the multipliers busy)
+    // ------------------------------------------------------------------------------------
+
+    void FrameHash::Reset()
+    {
+        Lanes[0] = HashPrime1 + HashPrime2;
+        Lanes[1] = HashPrime2;
+        Lanes[2] = 0;
+        Lanes[3] = 0 - HashPrime1;
+    }
+
+    void FrameHash::Fold(const void* data, size_t size)
+    {
+        FK_ASSERT(size % 8 == 0);
+        const uint8_t* p = static_cast<const uint8_t*>(data);
+        const uint8_t* end = p + size;
+        uint64_t a = Lanes[0], b = Lanes[1], c = Lanes[2], d = Lanes[3];
+        for (; end - p >= 32; p += 32)
+        {
+            a = HashRound(a, p);
+            b = HashRound(b, p + 8);
+            c = HashRound(c, p + 16);
+            d = HashRound(d, p + 24);
+        }
+        // Up to three words left: they go to the first lanes (the split is the same for the same frame).
+        if (p < end)
+            a = HashRound(a, p);
+        if (p + 8 < end)
+            b = HashRound(b, p + 8);
+        if (p + 16 < end)
+            c = HashRound(c, p + 16);
+        Lanes[0] = a;
+        Lanes[1] = b;
+        Lanes[2] = c;
+        Lanes[3] = d;
+    }
+
+    uint64_t FrameHash::Finish() const
+    {
+        uint64_t h = std::rotl(Lanes[0], 1) + std::rotl(Lanes[1], 7) + std::rotl(Lanes[2], 12) + std::rotl(Lanes[3], 18);
+        h ^= h >> 33;
+        h *= 0xFF51AFD7ED558CCDull;
+        h ^= h >> 33;
+        h *= 0xC4CEB9FE1A85EC53ull;
+        h ^= h >> 33;
+        return h;
+    }
+
+#if defined(FUNKY_PROFILE)
+    const FrameProfile& GetFrameProfile(const Ui* ui)
+    {
+        return Impl(ui)->Gpu.Profile();
+    }
+#endif
 
     // ------------------------------------------------------------------------------------
     // Input & frame info
@@ -456,7 +612,7 @@ namespace Funky
     Vec2 Ui::MeasureText(std::string_view text, const TextStyle& style)
     {
         UiImpl& ui = *Impl(this);
-        return ui.Text.Layout(text, style, ui.Scale, ui.FrameIndex, ui.Frame)->Size;
+        return ui.Text.Measure(text, style, ui.Scale, ui.Frame);
     }
 
     // ------------------------------------------------------------------------------------
@@ -471,16 +627,45 @@ namespace Funky
 
     GpuShape* UiImpl::EmitShapes(uint32_t count)
     {
-        if ((Runs.IsEmpty() || Runs.Back().Layer != CurrentLayer) && !Runs.Push({ CurrentLayer, Shapes.Count, 0 }))
-            return nullptr;
-        GpuShape* shapes = Shapes.Append(count);
+        FoldEmitted();
+        DrawRun* run = CurrentRun(*this, BatchShapes, Shapes.Count);
+        GpuShape* shapes = run ? Shapes.Append(count) : nullptr;
         if (!shapes)
             return nullptr;
-        Runs.Back().Count += count;
+        run->Count += count;
         MemZero(shapes, sizeof(GpuShape) * count);
         for (uint32_t i = 0; i < count; ++i)
             shapes[i].TypeFlags = CurrentClip << ShapeClipShift;
         return shapes;
+    }
+
+    GpuGlyph* UiImpl::EmitGlyphs(uint32_t count, const ClipRect& bounds)
+    {
+        FoldEmitted();
+        DrawRun* run = CurrentRun(*this, BatchGlyphs, Glyphs.Count);
+        GpuGlyph* glyphs = run ? Glyphs.Append(count) : nullptr;
+        if (!glyphs)
+            return nullptr;
+        run->Count += count;
+        run->Bounds = { Min(run->Bounds.MinX, bounds.MinX), Min(run->Bounds.MinY, bounds.MinY),
+                        Max(run->Bounds.MaxX, bounds.MaxX), Max(run->Bounds.MaxY, bounds.MaxY) };
+        return glyphs;
+    }
+
+    // Called before every emission, so it hashes what the previous one wrote: still in the cache, and
+    // complete (nothing is changed after the next emission).
+    void UiImpl::FoldEmitted()
+    {
+        if (Embedded)
+            return;
+        Hash.Fold(Shapes.Data + HashedShapes, sizeof(GpuShape) * (Shapes.Count - HashedShapes));
+        Hash.Fold(Glyphs.Data + HashedGlyphs, sizeof(GpuGlyph) * (Glyphs.Count - HashedGlyphs));
+        Hash.Fold(Points.Data + HashedPoints, sizeof(Vec2) * (Points.Count - HashedPoints));
+        Hash.Fold(Clips.Data + HashedClips, sizeof(ClipRect) * (Clips.Count - HashedClips));
+        HashedShapes = Shapes.Count;
+        HashedGlyphs = Glyphs.Count;
+        HashedPoints = Points.Count;
+        HashedClips = Clips.Count;
     }
 
     void UiImpl::SetLayer(uint64_t layer)
@@ -627,6 +812,7 @@ namespace Funky
         state->Opacity = Saturate(props.Opacity) * fade;
 
         Rect rect = { position.X, position.Y, size.X, size.Y };
+        state->FirstRun = state->EndRun = ui.Runs.Count; // the panel's runs start here (see BuildFrame)
         ui.SetLayer(id);
         DrawRect(rect, { .Fill = props.Background, .Stroke = props.BorderBrush, .StrokeThickness = props.BorderThickness,
                          .CornerRadius = props.CornerRadius, .Glow = props.Glow, .Shadow = props.Shadow });
@@ -649,6 +835,7 @@ namespace Funky
         }
         if (!ui.OpenContainers.Push(panel))
         {
+            state->EndRun = ui.Runs.Count;
             ui.SetLayer(0);
             ui.CurrentClip = ui.Top().ClipIndex;
             return Scope(nullptr, false);
@@ -666,6 +853,7 @@ namespace Funky
         PanelState* state = Panels.Find(panel.Id);
         if (!state)
             return;
+        state->EndRun = Runs.Count;
         state->Size = panel.Measured + (panel.Outer.Size() - panel.Content.Size()); // content + padding + title bar
         state->LastRect = panel.Outer;
 

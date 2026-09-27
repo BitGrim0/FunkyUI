@@ -95,7 +95,17 @@
     <ClCompile Include="src\Ui.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <None Include="src\Shaders\Common.hlsl" />
+    <None Include="src\Shaders\Glyph.hlsl" />
     <None Include="src\Shaders\Shape.hlsl" />
+    <FxCompile Include="src\Shaders\GlyphVS.hlsl">
+      <ShaderType>Vertex</ShaderType>
+      <EntryPointName>VSMain</EntryPointName>
+    </FxCompile>
+    <FxCompile Include="src\Shaders\GlyphPS.hlsl">
+      <ShaderType>Pixel</ShaderType>
+      <EntryPointName>PSMain</EntryPointName>
+    </FxCompile>
     <FxCompile Include="src\Shaders\ShapeVS.hlsl">
       <ShaderType>Vertex</ShaderType>
       <EntryPointName>VSMain</EntryPointName>

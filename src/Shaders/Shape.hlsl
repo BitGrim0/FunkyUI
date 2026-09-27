@@ -1,7 +1,9 @@
 // One vertex shader and one pixel shader for every shape. Each instance is a screen-aligned quad;
 // the pixel shader evaluates the shape's signed distance (DIPs, negative inside) and turns it into
-// coverage in physical pixels. Colors are sRGB with straight alpha; output is premultiplied sRGB.
-// struct Shape and the constants below mirror Funky::GpuShape and friends in src/Internal.h.
+// coverage in physical pixels. struct Shape and the constants below mirror Funky::GpuShape and
+// friends in src/Internal.h.
+
+#include "Common.hlsl"
 
 struct Shape
 {
@@ -23,8 +25,7 @@ static const uint ShapeRoundRect = 0;
 static const uint ShapePolyline = 1;
 static const uint ShapeArc = 2;
 static const uint ShapeTriangle = 3;
-static const uint ShapeGlyph = 4;
-static const uint ShapeImage = 5;
+static const uint ShapeImage = 4;
 
 static const uint ShapeTypeMask = 0xFF;
 static const uint FlagGradient = 1u << 8;
@@ -37,40 +38,43 @@ static const float GlowFalloff = 4;     // exp(-4) ~ 2%: the glow has faded out 
 static const float GlowTail = 0.0183156; // exp(-GlowFalloff)
 
 StructuredBuffer<Shape> Shapes : register(t0);
-StructuredBuffer<float4> Clips : register(t1); // (minX, minY, maxX, maxY), DIPs; [0] = no clipping
-Texture2D<float4> Atlas : register(t2);        // glyph atlas (R8G8: coverage, distance field) or an image
 StructuredBuffer<float2> Points : register(t3); // polyline vertices, DIPs
-SamplerState LinearClamp : register(s0);
-
-cbuffer Constants : register(b0)
-{
-    float2 ViewportSize;    // DIPs
-    float DpiScale;         // physical pixels per DIP
-    uint FirstShape;        // SV_InstanceID does not include the draw's start instance
-    float2 AtlasTexelSize;  // 1 / atlas size: glyph coordinates are in texels
-};
 
 struct Varyings
 {
     float4 Position : SV_Position;
     nointerpolation uint Index : TEXCOORD0;
+    nointerpolation float4 Clip : TEXCOORD1;     // DIPs
+    nointerpolation float4 Interior : TEXCOORD2; // fast path area, DIPs (empty: none)
+    nointerpolation float4 Fill : TEXCOORD3;     // fast path color: premultiplied fill x Opacity
 };
 
 // ----------------------------------------------------------------------------------------------
 // Vertex shader
 // ----------------------------------------------------------------------------------------------
 
+// Where the pixels of a plain round rect (solid fill, no blur, no image) are surely just its fill:
+// the rect inset by the inner stroke, a pixel of antialiasing, and r (1 - 1/sqrt 2) for the corners
+// (the inset rect's corners then lie inside every corner arc). Empty for every other shape.
+float4 SolidInterior(Shape s)
+{
+    bool plain = (s.TypeFlags & (ShapeTypeMask | FlagGradient)) == ShapeRoundRect && s.Softness <= 0;
+    float radius = max(max(s.P1.x, s.P1.y), max(s.P1.z, s.P1.w));
+    float inset = s.StrokeWidth + 1 / DpiScale + radius * (1 - 0.70710678);
+    return plain ? s.P0 + float4(inset, inset, -inset, -inset) : float4(1, 1, 0, 0);
+}
+
 Varyings VSMain(uint vertexId : SV_VertexID, uint instanceId : SV_InstanceID)
 {
-    uint index = FirstShape + instanceId;
-    float4 bounds = Shapes[index].Bounds;
-
-    // Triangle strip corners: (min, min), (max, min), (min, max), (max, max).
-    float2 dip = lerp(bounds.xy, bounds.zw, float2(vertexId & 1, vertexId >> 1));
+    uint index = FirstInstance + instanceId;
+    Shape s = Shapes[index];
 
     Varyings output;
-    output.Position = float4(dip / ViewportSize * float2(2, -2) + float2(-1, 1), 0, 1);
+    output.Position = ToClipSpace(lerp(s.Bounds.xy, s.Bounds.zw, QuadCorner(vertexId)));
     output.Index = index;
+    output.Clip = Clips[s.TypeFlags >> ShapeClipShift];
+    output.Interior = SolidInterior(s);
+    output.Fill = Premultiply(UnpackColor(s.Fill0)) * Opacity;
     return output;
 }
 
@@ -200,11 +204,6 @@ float SignedDistance(Shape s, float2 p, uint type)
 // Color
 // ----------------------------------------------------------------------------------------------
 
-float4 UnpackColor(uint c)
-{
-    return float4(c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, c >> 24) / 255.0;
-}
-
 float3 SrgbToLinear(float3 c)
 {
     return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
@@ -213,11 +212,6 @@ float3 SrgbToLinear(float3 c)
 float3 LinearToSrgb(float3 c)
 {
     return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(abs(c), 1 / 2.4) - 0.055;
-}
-
-float4 Premultiply(float4 c)
-{
-    return float4(c.rgb * c.a, c.a);
 }
 
 // Fill color at p: Fill0, or the gradient Fill0 -> Fill1 along P2.xy -> P2.zw.
@@ -237,7 +231,7 @@ float4 FillColor(Shape s, float2 p)
     return color;
 }
 
-// Atlas / image coordinates: Bounds maps linearly onto the rect P0 (glyphs: texels, images: UV).
+// Image coordinates: Bounds maps linearly onto the UV rect P0.
 float2 BoundsUv(Shape s, float2 p)
 {
     return lerp(s.P0.xy, s.P0.zw, (p - s.Bounds.xy) / (s.Bounds.zw - s.Bounds.xy));
@@ -259,23 +253,19 @@ float Erf(float x)
 
 float4 PSMain(Varyings input) : SV_Target
 {
-    Shape s = Shapes[input.Index];
     // The pixel center, not an interpolated position: bit-identical in every instance covering the
     // pixel, which the triangle fan's seam test relies on.
-    float2 p = input.Position.xy / DpiScale;
+    float2 p = PixelCenter(input.Position);
+    if (IsClipped(p, input.Clip))
+        discard;
 
-    uint clipIndex = s.TypeFlags >> ShapeClipShift;
-    if (clipIndex != 0)
-    {
-        float4 rect = Clips[clipIndex];
-        if (any(p < rect.xy) || any(p >= rect.zw))
-            discard;
-    }
+    // Fast path for the bulk of large fills: exactly what the rest returns there (full coverage, no
+    // stroke band, no glow), without loading the shape or evaluating its distance.
+    if (all(p >= input.Interior.xy) && all(p < input.Interior.zw))
+        return input.Fill;
 
+    Shape s = Shapes[input.Index];
     uint type = s.TypeFlags & ShapeTypeMask;
-    if (type == ShapeGlyph)
-        return Premultiply(FillColor(s, p)) * Atlas.SampleLevel(LinearClamp, BoundsUv(s, p) * AtlasTexelSize, 0).r;
-
     float d = SignedDistance(s, p, type);
 
     // Blurred silhouette (shadow): the edge of a Gaussian-blurred half-plane. Sigma never drops
@@ -283,7 +273,7 @@ float4 PSMain(Varyings input) : SV_Target
     if (s.Softness > 0)
     {
         float sigma = max(s.Softness * DpiScale, 0.4);
-        return Premultiply(UnpackColor(s.Fill0)) * (0.5 - 0.5 * Erf(d * DpiScale / (sigma * sqrt(2))));
+        return Premultiply(UnpackColor(s.Fill0)) * (0.5 - 0.5 * Erf(d * DpiScale / (sigma * sqrt(2)))) * Opacity;
     }
 
     float4 fill = FillColor(s, p);
@@ -307,5 +297,5 @@ float4 PSMain(Varyings input) : SV_Target
         glow.a *= saturate((exp(-GlowFalloff * x * x) - GlowTail) / (1 - GlowTail));
         color += Premultiply(glow) * (1 - coverage);
     }
-    return color;
+    return color * Opacity;
 }

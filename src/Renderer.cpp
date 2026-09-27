@@ -1,5 +1,6 @@
-// D3D11 + DirectComposition renderer: every shape is one instanced quad whose signed distance
-// function is evaluated in Shaders/Shape.hlsl. No input layout, no vertex buffer.
+// D3D11 + DirectComposition renderer. Every primitive is one instanced quad built from SV_VertexID (no input
+// layout, no vertex buffer), in two kinds with their own instance buffers and shaders: shapes (GpuShape, the
+// signed distance function in Shaders/Shape.hlsl) and glyphs (GpuGlyph, atlas coverage in Shaders/Glyph.hlsl).
 // Embedded mode draws with the client's device into the client's render target instead.
 
 #include "Internal.h"
@@ -11,8 +12,10 @@
 #include <dxgi1_3.h>
 #include <dcomp.h>
 
-#include "ShapeVS.h"
+#include "GlyphPS.h"
+#include "GlyphVS.h"
 #include "ShapePS.h"
+#include "ShapeVS.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -23,6 +26,7 @@ namespace Funky
     namespace
     {
         constexpr uint32_t RestoreInterval = 60; // frames between attempts to recreate a lost device
+        constexpr UINT ViewCount = 5;            // t0 shapes, t1 clips, t2 atlas, t3 points, t4 glyphs (both stages)
 
         template <class T>
         void SafeRelease(T*& object)
@@ -34,7 +38,8 @@ namespace Funky
             }
         }
 
-        // Dynamic structured buffer with its view, grown by doubling.
+        // Dynamic structured buffer with its view, grown by doubling. Rewritten whole every frame with
+        // WRITE_DISCARD: the driver hands out fresh memory while the GPU may still read last frame's.
         struct GpuBuffer
         {
             ID3D11Buffer* Buffer;
@@ -85,14 +90,15 @@ namespace Funky
             }
         };
 
-        // Mirrors cbuffer Constants in Shape.hlsl.
+        // Mirrors cbuffer Constants in Shaders/Common.hlsl.
         struct ShaderConstants
         {
             float ViewportSize[2];      // DIPs
             float DpiScale;
-            uint32_t FirstShape;        // SV_InstanceID does not include the draw's start instance
+            uint32_t FirstInstance;     // SV_InstanceID does not include the draw's start instance
             float AtlasTexelSize[2];
-            float Padding[2];
+            float Opacity;              // the batch's layer opacity
+            float Padding;
         };
 
         static_assert(sizeof(ShaderConstants) % 16 == 0);
@@ -133,8 +139,8 @@ namespace Funky
             SavedShader<ID3D11GeometryShader> GS; // the other stages are unbound while drawing
             SavedShader<ID3D11HullShader> HS;
             SavedShader<ID3D11DomainShader> DS;
-            ID3D11ShaderResourceView* VSView;
-            ID3D11ShaderResourceView* PSViews[4];
+            ID3D11ShaderResourceView* VSViews[ViewCount];
+            ID3D11ShaderResourceView* PSViews[ViewCount];
             ID3D11SamplerState* PSSampler;
             ID3D11Buffer* VSConstants;
             ID3D11Buffer* PSConstants;
@@ -154,8 +160,8 @@ namespace Funky
                 c->GSGetShader(&GS.Shader, GS.Instances, &GS.InstanceCount);
                 c->HSGetShader(&HS.Shader, HS.Instances, &HS.InstanceCount);
                 c->DSGetShader(&DS.Shader, DS.Instances, &DS.InstanceCount);
-                c->VSGetShaderResources(0, 1, &VSView);
-                c->PSGetShaderResources(0, ARRAYSIZE(PSViews), PSViews);
+                c->VSGetShaderResources(0, ViewCount, VSViews);
+                c->PSGetShaderResources(0, ViewCount, PSViews);
                 c->PSGetSamplers(0, 1, &PSSampler);
                 c->VSGetConstantBuffers(0, 1, &VSConstants);
                 c->PSGetConstantBuffers(0, 1, &PSConstants);
@@ -179,8 +185,8 @@ namespace Funky
                 c->GSSetShader(GS.Shader, GS.Instances, GS.InstanceCount);
                 c->HSSetShader(HS.Shader, HS.Instances, HS.InstanceCount);
                 c->DSSetShader(DS.Shader, DS.Instances, DS.InstanceCount);
-                c->VSSetShaderResources(0, 1, &VSView);
-                c->PSSetShaderResources(0, ARRAYSIZE(PSViews), PSViews);
+                c->VSSetShaderResources(0, ViewCount, VSViews);
+                c->PSSetShaderResources(0, ViewCount, PSViews);
                 c->PSSetSamplers(0, 1, &PSSampler);
                 c->VSSetConstantBuffers(0, 1, &VSConstants);
                 c->PSSetConstantBuffers(0, 1, &PSConstants);
@@ -196,9 +202,11 @@ namespace Funky
                 GS.Release();
                 HS.Release();
                 DS.Release();
-                SafeRelease(VSView);
-                for (ID3D11ShaderResourceView*& view : PSViews)
-                    SafeRelease(view);
+                for (UINT i = 0; i < ViewCount; ++i)
+                {
+                    SafeRelease(VSViews[i]);
+                    SafeRelease(PSViews[i]);
+                }
                 SafeRelease(PSSampler);
                 SafeRelease(VSConstants);
                 SafeRelease(PSConstants);
@@ -221,13 +229,14 @@ namespace Funky
         ID3D11RenderTargetView* ClientTarget; // embedded: the view the next Render draws into
         ContextState Saved;                   // embedded: the client's state during Render (too big for the stack)
 
-        ID3D11VertexShader* VertexShader;
-        ID3D11PixelShader* PixelShader;
+        ID3D11VertexShader* VertexShaders[2]; // by BatchKind
+        ID3D11PixelShader* PixelShaders[2];
         ID3D11BlendState* Blend;
         ID3D11RasterizerState* Rasterizer;
         ID3D11SamplerState* Sampler;
         ID3D11Buffer* Constants;
         GpuBuffer Shapes;
+        GpuBuffer Glyphs;
         GpuBuffer Clips;
         GpuBuffer Points;
 
@@ -238,6 +247,7 @@ namespace Funky
         uint32_t Width;     // physical pixels, as last requested (a restored device uses them)
         uint32_t Height;
         uint32_t RestoreDelay; // frames until the next attempt to recreate a lost device
+        FK_PROFILE(FrameProfile Profile;)
 
         // Embedded: the device is already set. Until the first glyph arrives, t2 samples a 1x1 empty atlas.
         bool CreateAll()
@@ -267,6 +277,7 @@ namespace Funky
             SafeRelease(SwapChain);
 
             Shapes.Release();
+            Glyphs.Release();
             Clips.Release();
             Points.Release();
             SafeRelease(AtlasView);
@@ -276,8 +287,10 @@ namespace Funky
             SafeRelease(Sampler);
             SafeRelease(Rasterizer);
             SafeRelease(Blend);
-            SafeRelease(PixelShader);
-            SafeRelease(VertexShader);
+            for (ID3D11PixelShader*& shader : PixelShaders)
+                SafeRelease(shader);
+            for (ID3D11VertexShader*& shader : VertexShaders)
+                SafeRelease(shader);
             SafeRelease(Context);
             SafeRelease(Device);
         }
@@ -387,8 +400,10 @@ namespace Funky
             constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
             constants.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-            return SUCCEEDED(Device->CreateVertexShader(g_ShapeVS, sizeof(g_ShapeVS), nullptr, &VertexShader)) &&
-                   SUCCEEDED(Device->CreatePixelShader(g_ShapePS, sizeof(g_ShapePS), nullptr, &PixelShader)) &&
+            return SUCCEEDED(Device->CreateVertexShader(g_ShapeVS, sizeof(g_ShapeVS), nullptr, &VertexShaders[BatchShapes])) &&
+                   SUCCEEDED(Device->CreatePixelShader(g_ShapePS, sizeof(g_ShapePS), nullptr, &PixelShaders[BatchShapes])) &&
+                   SUCCEEDED(Device->CreateVertexShader(g_GlyphVS, sizeof(g_GlyphVS), nullptr, &VertexShaders[BatchGlyphs])) &&
+                   SUCCEEDED(Device->CreatePixelShader(g_GlyphPS, sizeof(g_GlyphPS), nullptr, &PixelShaders[BatchGlyphs])) &&
                    SUCCEEDED(Device->CreateBlendState(&blend, &Blend)) &&
                    SUCCEEDED(Device->CreateRasterizerState(&rasterizer, &Rasterizer)) &&
                    SUCCEEDED(Device->CreateSamplerState(&sampler, &Sampler)) &&
@@ -430,57 +445,84 @@ namespace Funky
             return true;
         }
 
+        // The shaders are set per batch kind by Draw.
         void BindPipeline()
         {
             D3D11_VIEWPORT viewport = { 0, 0, float(Width), float(Height), 0, 1 };
-            ID3D11ShaderResourceView* views[] = { Shapes.View, Clips.View, AtlasView, Points.View };
+            ID3D11ShaderResourceView* views[ViewCount] = { Shapes.View, Clips.View, AtlasView, Points.View, Glyphs.View };
 
             Context->RSSetViewports(1, &viewport);
             Context->RSSetState(Rasterizer);
             Context->OMSetBlendState(Blend, nullptr, 0xFFFFFFFF);
             Context->IASetInputLayout(nullptr);
             Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-            Context->VSSetShader(VertexShader, nullptr, 0);
-            Context->VSSetShaderResources(0, 1, views);
+            Context->VSSetShaderResources(0, ViewCount, views);
             Context->VSSetConstantBuffers(0, 1, &Constants);
-            Context->PSSetShader(PixelShader, nullptr, 0);
-            Context->PSSetShaderResources(0, ARRAYSIZE(views), views);
+            Context->PSSetShaderResources(0, ViewCount, views);
             Context->PSSetSamplers(0, 1, &Sampler);
             Context->PSSetConstantBuffers(0, 1, &Constants);
         }
 
-        // Uploads the frame and draws it into the bound render target.
-        bool Draw(const GpuShape* shapes, uint32_t shapeCount,
-                  const DrawBatch* batches, uint32_t batchCount,
-                  const ClipRect* clips, uint32_t clipCount,
-                  const Vec2* points, uint32_t pointCount, float dpiScale)
+        // Copies the frame's instances, points and clips into the GPU buffers (Map / Unmap only: the
+        // bound state is not touched).
+        bool Upload(const FrameData& f)
         {
-            if (shapeCount == 0)
+            if (f.BatchCount == 0)
+                return true; // nothing to draw
+            return (f.ShapeCount == 0 || Shapes.Upload(Device, Context, f.Shapes, f.ShapeCount, sizeof(GpuShape))) &&
+                   (f.GlyphCount == 0 || Glyphs.Upload(Device, Context, f.Glyphs, f.GlyphCount, sizeof(GpuGlyph))) &&
+                   (f.PointCount == 0 || Points.Upload(Device, Context, f.Points, f.PointCount, sizeof(Vec2))) &&
+                   Clips.Upload(Device, Context, f.Clips, f.ClipCount, sizeof(ClipRect));
+        }
+
+        // Draws the uploaded frame into the bound render target, one draw call per batch.
+        bool Draw(const FrameData& f)
+        {
+            if (f.BatchCount == 0)
                 return true;
-            if (!Shapes.Upload(Device, Context, shapes, shapeCount, sizeof(GpuShape)) ||
-                !Clips.Upload(Device, Context, clips, clipCount, sizeof(ClipRect)) ||
-                (pointCount > 0 && !Points.Upload(Device, Context, points, pointCount, sizeof(Vec2))))
-                return false;
             BindPipeline();
 
             ShaderConstants constants = {};
-            constants.ViewportSize[0] = float(Width) / dpiScale;
-            constants.ViewportSize[1] = float(Height) / dpiScale;
-            constants.DpiScale = dpiScale;
+            constants.ViewportSize[0] = float(Width) / f.DpiScale;
+            constants.ViewportSize[1] = float(Height) / f.DpiScale;
+            constants.DpiScale = f.DpiScale;
             constants.AtlasTexelSize[0] = 1.0f / float(Max(AtlasSize, 1u));
             constants.AtlasTexelSize[1] = constants.AtlasTexelSize[0];
 
-            // Every batch samples the glyph atlas: DrawBatch::Texture only matters once images exist (stage 3).
-            for (uint32_t i = 0; i < batchCount; ++i)
+            // Shaders change only with the batch kind; every batch sets its first instance and opacity.
+            uint32_t kind = ~0u;
+            for (uint32_t i = 0; i < f.BatchCount; ++i)
             {
-                constants.FirstShape = batches[i].FirstShape;
+                const DrawBatch& batch = f.Batches[i];
+                if (batch.Kind != kind)
+                {
+                    kind = batch.Kind;
+                    Context->VSSetShader(VertexShaders[kind], nullptr, 0);
+                    Context->PSSetShader(PixelShaders[kind], nullptr, 0);
+                }
+                constants.FirstInstance = batch.First;
+                constants.Opacity = batch.Opacity;
                 if (!SetConstants(constants))
                     return false;
-                Context->DrawInstanced(4, batches[i].ShapeCount, 0, 0);
+                Context->DrawInstanced(4, batch.Count, 0, 0);
             }
             return true;
         }
     };
+
+#if defined(FUNKY_PROFILE)
+    int64_t ProfileTicks()
+    {
+        LARGE_INTEGER ticks;
+        QueryPerformanceCounter(&ticks);
+        return ticks.QuadPart;
+    }
+
+    FrameProfile& Renderer::Profile() const
+    {
+        return State->Profile;
+    }
+#endif
 
     bool Renderer::Init(HWND__* window, uint32_t width, uint32_t height)
     {
@@ -581,38 +623,41 @@ namespace Funky
         Impl& s = *State;
         if (!s.Device)
             return; // RestoreDevice asks for the whole atlas again
+        FK_PROFILE(int64_t start = ProfileTicks();)
         if (update.Recreate || update.Size != s.AtlasSize)
-        {
             s.CreateAtlas(update.Size, update.Pixels);
-            return;
+        else if (update.Width > 0 && update.Height > 0)
+        {
+            const uint32_t pitch = update.Size * 2;
+            D3D11_BOX box = { update.X, update.Y, 0, update.X + update.Width, update.Y + update.Height, 1 };
+            s.Context->UpdateSubresource(s.Atlas, 0, &box, update.Pixels + update.Y * pitch + update.X * 2, pitch, 0);
         }
-        if (update.Width == 0 || update.Height == 0)
-            return;
-
-        const uint32_t pitch = update.Size * 2;
-        D3D11_BOX box = { update.X, update.Y, 0, update.X + update.Width, update.Y + update.Height, 1 };
-        s.Context->UpdateSubresource(s.Atlas, 0, &box, update.Pixels + update.Y * pitch + update.X * 2, pitch, 0);
+        FK_PROFILE(s.Profile.Upload += ProfileTicks() - start;)
     }
 
-    bool Renderer::Render(const GpuShape* shapes, uint32_t shapeCount,
-                          const DrawBatch* batches, uint32_t batchCount,
-                          const ClipRect* clips, uint32_t clipCount,
-                          const Vec2* points, uint32_t pointCount, float dpiScale)
+    bool Renderer::Render(const FrameData& frame)
     {
         Impl& s = *State;
         if (s.Embedded)
         {
             // On top of the client's target, then the client's context state is given back as it was.
             bool ok = s.ClientTarget != nullptr;
-            if (ok && shapeCount > 0)
+            if (ok && frame.BatchCount > 0)
             {
-                s.Saved.Save(s.Context);
-                s.Context->OMSetRenderTargets(1, &s.ClientTarget, nullptr);
-                s.Context->GSSetShader(nullptr, nullptr, 0);
-                s.Context->HSSetShader(nullptr, nullptr, 0);
-                s.Context->DSSetShader(nullptr, nullptr, 0);
-                ok = s.Draw(shapes, shapeCount, batches, batchCount, clips, clipCount, points, pointCount, dpiScale);
-                s.Saved.Restore(s.Context);
+                FK_PROFILE(int64_t start = ProfileTicks();)
+                ok = s.Upload(frame);
+                FK_PROFILE(int64_t uploaded = ProfileTicks();)
+                if (ok)
+                {
+                    s.Saved.Save(s.Context);
+                    s.Context->OMSetRenderTargets(1, &s.ClientTarget, nullptr);
+                    s.Context->GSSetShader(nullptr, nullptr, 0);
+                    s.Context->HSSetShader(nullptr, nullptr, 0);
+                    s.Context->DSSetShader(nullptr, nullptr, 0);
+                    ok = s.Draw(frame);
+                    s.Saved.Restore(s.Context);
+                }
+                FK_PROFILE(s.Profile.Upload += uploaded - start; s.Profile.Draw += ProfileTicks() - uploaded;)
             }
             SafeRelease(s.ClientTarget); // see SetTarget
             return ok;
@@ -620,13 +665,21 @@ namespace Funky
 
         if (!s.Device || (!s.BackBuffer && !s.CreateBackBufferView()))
             return false;
+        FK_PROFILE(int64_t start = ProfileTicks();)
+        if (!s.Upload(frame))
+            return false;
+        FK_PROFILE(int64_t uploaded = ProfileTicks();)
 
         // Present unbinds the back buffer (flip model), so bind it every frame.
         const float transparent[4] = {};
         s.Context->OMSetRenderTargets(1, &s.BackBuffer, nullptr);
         s.Context->ClearRenderTargetView(s.BackBuffer, transparent);
-        return s.Draw(shapes, shapeCount, batches, batchCount, clips, clipCount, points, pointCount, dpiScale) &&
-               SUCCEEDED(s.SwapChain->Present(1, 0));
+        bool ok = s.Draw(frame);
+        FK_PROFILE(int64_t drawn = ProfileTicks();)
+        // Only queues the frame: BeginFrame already waited on the frame-latency waitable for its slot.
+        ok = ok && SUCCEEDED(s.SwapChain->Present(1, 0));
+        FK_PROFILE(s.Profile.Upload += uploaded - start; s.Profile.Draw += drawn - uploaded; s.Profile.Present += ProfileTicks() - drawn;)
+        return ok;
     }
 
     void* Renderer::FrameWaitable() const

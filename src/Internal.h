@@ -13,9 +13,11 @@ struct ID3D11RenderTargetView;
 namespace Funky
 {
     // ====================================================================================
-    // GPU shape instance — shared layout with src/Shaders/Shape.hlsl (struct Shape).
-    // One instance = one screen-aligned quad; the pixel shader evaluates the shape's signed
-    // distance function. All geometry is in DIPs; the shader converts to pixels with DpiScale.
+    // GPU instances. Every primitive is one screen-aligned quad; the kinds are batched separately
+    // (like Zed's GPUI), each with its own compact instance buffer and shaders:
+    //   GpuShape — src/Shaders/Shape.hlsl: the pixel shader evaluates the shape's signed distance function;
+    //   GpuGlyph — src/Shaders/Glyph.hlsl: a textured quad from the glyph atlas.
+    // All geometry is in DIPs; the shaders convert to pixels with DpiScale.
     // ====================================================================================
 
     enum ShapeType : uint32_t
@@ -24,8 +26,7 @@ namespace Funky
         ShapePolyline = 1,  // P0 = (first point, point count, half thickness): round-joined, round-capped stroke through UiImpl::Points
         ShapeArc = 2,       // P0 = (cx, cy, radius, half thickness), P1 = (start angle, sweep angle) radians, clockwise from +X (y down), round caps
         ShapeTriangle = 3,  // P0 = (ax, ay, bx, by), P1 = (cx, cy); edges AA'd only if their Flag*Edge bit is set
-        ShapeGlyph = 4,     // Bounds = glyph quad, P0 = atlas texel rect (x0, y0, x1, y1); coverage in atlas .r, distance field in .g
-        ShapeImage = 5,     // stage 3: Bounds = image rect, P0 = UV, P1 = corner radii
+        ShapeImage = 4,     // stage 3: Bounds = image rect, P0 = UV, P1 = corner radii
     };
 
     enum ShapeFlags : uint32_t
@@ -57,22 +58,63 @@ namespace Funky
 
     static_assert(sizeof(GpuShape) == 96);
 
+    // Glyph instance — shared layout with src/Shaders/Glyph.hlsl (struct Glyph). One color per glyph:
+    // a gradient brush is sampled at the glyph's center on the CPU.
+    struct GpuGlyph
+    {
+        float Rect[4];       // quad (minX, minY, maxX, maxY), DIPs
+        uint32_t Texel0;     // atlas texel of the top-left corner: x | y << 16
+        uint32_t Texel1;     // bottom-right corner (exclusive)
+        uint32_t Color;      // packed Color, sRGB, straight alpha
+        uint32_t Clip;       // index into the clip rect buffer (0 = none)
+    };
+
+    static_assert(sizeof(GpuGlyph) == 32);
+
     struct ClipRect
     {
         float MinX, MinY, MaxX, MaxY; // DIPs
     };
 
+    enum BatchKind : uint32_t
+    {
+        BatchShapes = 0,
+        BatchGlyphs = 1,
+    };
+
+    // One draw call: a range of one instance buffer, in paint order.
     struct DrawBatch
     {
-        uint32_t FirstShape;
-        uint32_t ShapeCount;
-        uint32_t Texture; // 0 = glyph atlas (images: stage 3)
+        uint32_t Kind;       // BatchKind: which buffer and shaders
+        uint32_t First;      // first instance in that buffer
+        uint32_t Count;
+        float Opacity;       // the layer's opacity (panel fade / Opacity), multiplies the shaders' output
     };
 
     constexpr uint32_t PackColor(Color c)
     {
         return uint32_t(c.R) | (uint32_t(c.G) << 8) | (uint32_t(c.B) << 16) | (uint32_t(c.A) << 24);
     }
+
+    // Compile-time profiler, off by default (no code at all without the define): QueryPerformanceCounter
+    // ticks spent in EndFrame's phases during the last frame. Build with FUNKY_PROFILE (library and reader)
+    // and read it with GetFrameProfile after EndFrame; a skipped frame has only Build.
+#if defined(FUNKY_PROFILE)
+    #define FK_PROFILE(...) __VA_ARGS__
+
+    struct FrameProfile
+    {
+        int64_t Build;      // BuildFrame (batches) and the frame hash
+        int64_t Upload;     // atlas and instance buffers
+        int64_t Draw;       // pipeline state and draw calls
+        int64_t Present;    // Present (overlay only)
+    };
+
+    const FrameProfile& GetFrameProfile(const Ui* ui);
+    int64_t ProfileTicks();
+#else
+    #define FK_PROFILE(...)
+#endif
 
     // ====================================================================================
     // Host — the overlay window (Host.cpp)
@@ -121,7 +163,7 @@ namespace Funky
     };
 
     // ====================================================================================
-    // Renderer — D3D11 + DirectComposition (Renderer.cpp, Shaders/Shape.hlsl).
+    // Renderer — D3D11 + DirectComposition (Renderer.cpp, Shaders/).
     // Embedded mode: the client's device, no swap chain; draws into the view given by SetTarget.
     // ====================================================================================
 
@@ -131,6 +173,22 @@ namespace Funky
         uint32_t Size;          // atlas width = height, texels
         uint32_t X, Y, Width, Height; // dirty region to upload
         bool Recreate;          // size changed or atlas reset: recreate the texture and upload everything
+    };
+
+    // Everything one Render draws. Instances, points and clips are in DIPs.
+    struct FrameData
+    {
+        const GpuShape* Shapes;
+        uint32_t ShapeCount;
+        const GpuGlyph* Glyphs;
+        uint32_t GlyphCount;
+        const Vec2* Points;     // polyline vertices
+        uint32_t PointCount;
+        const ClipRect* Clips;  // [0] = no clipping
+        uint32_t ClipCount;
+        const DrawBatch* Batches; // paint order
+        uint32_t BatchCount;
+        float DpiScale;
     };
 
     class Renderer
@@ -151,14 +209,12 @@ namespace Funky
         bool RestoreDevice();
 
         // Overlay: clears to transparent, draws the batches and presents. Embedded: draws on top of the
-        // target and restores the device context state it changed. Shapes and points are in DIPs.
-        // clips[0] must be the "no clipping" rect.
-        bool Render(const GpuShape* shapes, uint32_t shapeCount,
-                    const DrawBatch* batches, uint32_t batchCount,
-                    const ClipRect* clips, uint32_t clipCount,
-                    const Vec2* points, uint32_t pointCount, float dpiScale);
+        // target and restores the device context state it changed.
+        bool Render(const FrameData& frame);
 
         void* FrameWaitable() const;        // HANDLE of the swap chain's frame-latency waitable object
+
+        FK_PROFILE(FrameProfile& Profile() const;)
 
     private:
         struct Impl;
@@ -166,7 +222,7 @@ namespace Funky
     };
 
     // ====================================================================================
-    // Text — DirectWrite shaping + glyph atlas (Text.cpp)
+    // Text — DirectWrite text layout + glyph atlas (Text.cpp)
     // ====================================================================================
 
     struct GlyphQuad
@@ -179,33 +235,38 @@ namespace Funky
     {
         GlyphQuad* Glyphs;
         uint32_t GlyphCount;
-        Vec2 Size;                  // DIPs (DirectWrite layout width / height)
+        Vec2 Size;                  // DIPs: widest line (with trailing spaces) × line heights
         float Baseline;             // DIPs from the top of the first line
     };
 
     class TextSystem
     {
     public:
-        bool Init(std::string_view defaultFamily, Arena& scratch);
+        bool Init(std::string_view defaultFamily, Arena& scratch); // fails when the family is not installed
         void Shutdown();
 
         Font LoadFont(std::string_view family, Arena& scratch); // returns the default font on failure
 
-        // Cached layout of the text (explicit '\n' line breaks, no wrapping). Never returns null:
-        // an empty layout is returned on failure. Valid until the next EndFrame().
-        const TextLayout* Layout(std::string_view text, const TextStyle& style, float dpiScale, uint32_t frame, Arena& scratch);
+        // Layout of the text (explicit line breaks, no wrapping). Never returns null: an empty layout is
+        // returned on failure. Valid until the next EndFrame(). Simple text (Latin, Greek, Cyrillic,
+        // punctuation) is laid out on every call without a cache; other text is shaped and cached while
+        // used every frame. scratch holds temporaries.
+        const TextLayout* Layout(std::string_view text, const TextStyle& style, float dpiScale, Arena& scratch);
+
+        // Layout(...)->Size; simple text is measured without building quads or rasterizing glyphs.
+        Vec2 Measure(std::string_view text, const TextStyle& style, float dpiScale, Arena& scratch);
 
         // Pending atlas upload, if any. The pixels stay valid until the next Layout() call.
         bool TakeAtlasUpdate(AtlasUpdate& update);
         void InvalidateAtlas();     // the GPU copy is gone: the next update uploads the whole atlas
 
-        // Evicts layouts and formats not used for a while. A full atlas is reset here, after the
-        // frame, so glyphs emitted earlier in a frame always stay valid.
-        void EndFrame(uint32_t frame);
+        // Ends the layouts' lifetime and frees shaped text not used this frame. A full atlas is reset
+        // here, after the frame, so glyphs emitted earlier in a frame always stay valid.
+        void EndFrame();
 
     private:
         struct Impl;
-        Impl* State = nullptr;      // DirectWrite objects, font families, glyph cache, layout cache, atlas
+        Impl* State = nullptr;      // DirectWrite objects, fonts, glyph cache, shaped layout cache, atlas
     };
 
     // ====================================================================================
@@ -270,9 +331,11 @@ namespace Funky
         Vec2 Size;              // outer size measured last frame
         Rect LastRect;          // rect drawn last frame (hit testing at BeginFrame)
         Vec2 DragOffset;        // pointer - position when the drag started
-        float Opacity;          // props.Opacity × fade-in, applied to the panel's shapes by BuildFrame
+        float Opacity;          // props.Opacity × fade-in: the opacity of the panel's batches (BuildFrame)
         uint32_t LastFrame;     // frame the panel was last submitted
         uint32_t FirstFrame;    // frame it (re)appeared: that frame is an invisible sizing pass
+        uint32_t FirstRun;      // its draw runs this frame lie in UiImpl::Runs[FirstRun, EndRun)
+        uint32_t EndRun;
         bool Dragged;           // position was set by dragging (Anchor no longer applies; kept by GC)
     };
 
@@ -306,15 +369,28 @@ namespace Funky
         bool Movable;
     };
 
-    // A contiguous range of shapes emitted into one layer.
-    struct ShapeRun
+    // A contiguous range of shapes or glyphs emitted into one layer.
+    struct DrawRun
     {
         uint64_t Layer;             // 0 = background, otherwise panel id; ForegroundLayer = on top of everything
-        uint32_t First;
+        uint32_t Kind;              // BatchKind
+        uint32_t First;             // into UiImpl::Shapes or UiImpl::Glyphs
         uint32_t Count;
+        ClipRect Bounds;            // glyph runs: union of the glyph quads (BuildFrame's overlap test)
     };
 
     constexpr uint64_t ForegroundLayer = ~0ull;
+
+    // Frame change detection (overlay): a 64-bit hash of everything that decides the frame's pixels.
+    // The data is folded in as it is emitted, while it is still in the cache (see UiImpl::FoldEmitted).
+    struct FrameHash
+    {
+        uint64_t Lanes[4];
+
+        void Reset();
+        void Fold(const void* data, size_t size); // size: a multiple of 8 bytes
+        uint64_t Finish() const;
+    };
 
     struct TransitionState
     {
@@ -347,6 +423,11 @@ namespace Funky
         bool PresentedLastFrame = false;
         uint64_t LastFrameHash = 0;
         bool ForceRedraw = true;
+        FrameHash Hash;                     // overlay: this frame's data folded so far
+        uint32_t HashedShapes = 0;          // prefixes of the arrays already in Hash
+        uint32_t HashedGlyphs = 0;
+        uint32_t HashedPoints = 0;
+        uint32_t HashedClips = 0;
 
         // Input (DIPs)
         InputEvents EmbeddedInput = {};     // embedded mode: fed by SetPointer (physical pixels, left button only)
@@ -368,16 +449,17 @@ namespace Funky
         HashMap<TransitionState> Transitions;
         Array<uint64_t> PanelOrder;         // z-order, back = topmost
 
-        // Per-frame draw data
+        // Per-frame draw data, in emission order. The GPU reads the instance arrays as they are: the
+        // batches pick ranges of them in paint order.
         Array<Container> OpenContainers;    // [0] = Root (the viewport)
-        Array<GpuShape> Shapes;             // in emission order
-        Array<ShapeRun> Runs;
+        Array<GpuShape> Shapes;
+        Array<GpuGlyph> Glyphs;
+        Array<DrawRun> Runs;
         Array<ClipRect> Clips;              // [0] = no clipping
         Array<Vec2> Points;                 // polyline vertices (ShapePolyline)
         uint64_t CurrentLayer = 0;
         uint32_t CurrentClip = 0;
-        Array<GpuShape> FinalShapes;        // Shapes reordered by layer for rendering
-        Array<DrawBatch> Batches;
+        Array<DrawBatch> Batches;           // paint order, built by BuildFrame
 
         // --- Ui.cpp ----------------------------------------------------------------------
         bool Init(const OverlayDesc& desc);
@@ -387,10 +469,12 @@ namespace Funky
         Container& Top() { return OpenContainers.Back(); }
         uint64_t MakeId(Key key);           // HashCombine(parent id, key) or positional when key is none
         GpuShape* EmitShapes(uint32_t count); // zeroed shapes in the current layer run, TypeFlags = clip index (OR the type in); null on OOM
+        GpuGlyph* EmitGlyphs(uint32_t count, const ClipRect& bounds); // uninitialized glyphs covering bounds (DIPs); null on OOM
+        void FoldEmitted();                 // overlay: folds the data emitted since the last call into Hash
         void SetLayer(uint64_t layer);
         uint32_t PushClip(Rect rect);       // intersected with the current clip; returns its index
         Funky::Widget Interact(uint64_t id, Rect rect, bool enabled); // hover / press / click
-        void BuildFrame();                  // runs → FinalShapes/Batches (applies panel opacity)
+        void BuildFrame();                  // runs → Batches in paint order
         void EndPanel();                    // EndScope of a panel: measure, drag, z-order
 
         // --- Layout.cpp ------------------------------------------------------------------
