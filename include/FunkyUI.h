@@ -574,6 +574,16 @@ namespace Funky
         Funky::Allocator Allocator;            // optional; default = process heap. Process-wide: give every overlay the same one
     };
 
+    // Embedded mode: FunkyUI draws into a render target of the client's own D3D11 device
+    // (for example on top of another swap chain's back buffer). No window, no Present, no frame
+    // pacing and no frame skipping: the client drives the loop and presents itself.
+    struct EmbeddedDesc
+    {
+        void* Device = nullptr;                // ID3D11Device* (its immediate context is used)
+        std::string_view DefaultFontFamily;    // UTF-8, required
+        Funky::Allocator Allocator;            // optional, see OverlayDesc
+    };
+
     class Ui;
 
     // RAII scope returned by containers: if (auto panel = ui.Panel("stats")) { ... }
@@ -601,7 +611,16 @@ namespace Funky
     {
     public:
         static Ui* Create(const OverlayDesc& desc); // nullptr on failure
+        static Ui* CreateEmbedded(const EmbeddedDesc& desc); // nullptr on failure
         void Destroy();
+
+        // --- Embedded mode (call before BeginFrame; ignored in overlay mode) -----------------
+        // Target of the next EndFrame: ID3D11RenderTargetView*, its size in physical pixels and the
+        // DIP scale. EndFrame draws on top of the existing contents (no clear) and restores the
+        // device context state it changed.
+        void SetRenderTarget(void* renderTargetView, uint32_t widthPx, uint32_t heightPx, float dpiScale = 1);
+        // Input for embedded mode: pointer in physical pixels relative to the render target.
+        void SetPointer(Vec2 positionPx, bool leftButtonDown);
 
         // --- Frame -------------------------------------------------------------------------
         // BeginFrame waits for the next frame slot, pumps window messages, follows the target

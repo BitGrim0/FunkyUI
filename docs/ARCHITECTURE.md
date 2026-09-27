@@ -166,3 +166,14 @@ Immediate-mode с памятью прошлого кадра, как догов�
   `std::span`/`std::string_view` зовут `_CrtDbgReport`. При `/Od` строковый литерал → `string_view`
   зовёт `strlen`: его клиент даёт сам, как `memcpy`.
 Запуск и визуальная проверка — на Windows.
+
+## Режим встраивания (embedded)
+
+`Ui::CreateEmbedded` создаёт UI без окна и swapchain'а на устройстве D3D11 клиента. Клиент каждый кадр
+вызывает `SetRenderTarget(rtv, w, h, scale)` и (для ввода) `SetPointer(pos, down)`, затем
+`BeginFrame`/`EndFrame`. `EndFrame` рисует поверх содержимого цели без очистки и Present, сохраняя и
+восстанавливая состояние контекста, которое меняет (IA, VS, PS, RS, OM, viewport, SRV, sampler, CB),
+как это делает бэкенд ImGui. Пропуска кадров нет: цель клиента перерисовывается каждый кадр.
+Host не создаётся; интерактивный режим управляется клиентом так же через `SetInteractive`.
+Этот режим используется бенчмарком Throughput (рендер в offscreen-текстуру без Present) и будет
+основой встраивания в чужой swapchain.
