@@ -41,8 +41,11 @@
       <LanguageStandard>stdcpplatest</LanguageStandard>
       <WarningLevel>Level4</WarningLevel>
       <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)src;$(IntDir)Shaders;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <!-- The CRT is the client's choice: no RuntimeLibrary / _ITERATOR_DEBUG_LEVEL stamps (FAILIFMISMATCH) from the STL headers. -->
-      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;_ALLOW_RUNTIME_LIBRARY_MISMATCH;_ALLOW_ITERATOR_DEBUG_LEVEL_MISMATCH;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- The CRT is the client's choice: no RuntimeLibrary / _ITERATOR_DEBUG_LEVEL stamps (FAILIFMISMATCH) from the STL headers,
+           and no C++ runtime library request (_USE_ANSI_CPP skips use_ansi.h, whose only content is
+           #pragma comment(lib, "libcpmt...")): the library calls nothing in it, and a /MD or /MDd client would get
+           a static runtime that conflicts with msvcrt(d).lib. -->
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;_ALLOW_RUNTIME_LIBRARY_MISMATCH;_ALLOW_ITERATOR_DEBUG_LEVEL_MISMATCH;_USE_ANSI_CPP;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ExceptionHandling>false</ExceptionHandling>
       <RuntimeTypeInfo>false</RuntimeTypeInfo>
       <BufferSecurityCheck>false</BufferSecurityCheck>
